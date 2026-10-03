@@ -248,6 +248,64 @@ console.log('4. 整层停用：enabled:false 撤干净，观察器不泄漏');
   await page.close();
 }
 
+console.log('5. 滑杆重建不泄漏 ResizeObserver；停用撤净灰框与等级页标记');
+{
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const errors = [];
+  page.on('pageerror', e => errors.push(String(e)));
+  await page.setContent(`<!doctype html><html><head></head><body>
+    <div data-slot="conversation.input.model"><button title="M - High">
+      <span class="_triggerLabel_">M</span><span class="_triggerEffort_">High</span></button></div>
+    <div id="host"></div></body></html>`);
+  const res = await page.evaluate(src => {
+    const RealRO = window.ResizeObserver;
+    let liveRO = 0;
+    window.ResizeObserver = function (cb) {
+      const real = new RealRO(cb);
+      liveRO++;
+      const d = real.disconnect.bind(real);
+      real.disconnect = function () { liveRO--; return d(); };
+      return real;
+    };
+    const lib = new Function(src + 'return { installSlider: installSlider, setSlider: setSlider };')();
+    const LEVELS = ['Off', 'Low', 'High', 'Max'];
+    const host = document.getElementById('host');
+
+    /* 模拟宿主反复重建菜单：装 5 次滑杆。 */
+    for (let k = 0; k < 5; k++) {
+      host.innerHTML = '<div role="menu">' + LEVELS.map((l, i) =>
+        '<button role="menuitemradio" aria-checked="' + (i === 2) + '">' + l + '</button>').join('') + '</div>';
+      lib.installSlider(host.firstElementChild);
+    }
+    const afterInstalls = liveRO;
+
+    /* 滑杆页开着时停用：灰框、模型行、档位标签、dshp-levelPage 都要撤干净，
+       否则 CSS 还藏着宿主选项行，留下"滑杆没了、选项也看不见"的空壳菜单。 */
+    const menu = host.querySelector('[role="menu"]');
+    const head = document.createElement('div');
+    head.className = 'dshp-head';
+    head.innerHTML = '<div class="dshp-levelLabel">High</div><div class="dshp-modelRow">M</div>';
+    menu.insertBefore(head, menu.firstChild);
+    menu.classList.add('dshp-levelPage');
+    lib.setSlider(false);
+    const afterOff = {
+      liveRO: liveRO,
+      head: !!document.querySelector('.dshp-head'),
+      modelRow: !!document.querySelector('.dshp-modelRow'),
+      label: !!document.querySelector('.dshp-levelLabel'),
+      levelPage: !!document.querySelector('.dshp-levelPage'),
+    };
+    window.ResizeObserver = RealRO;
+    return { afterInstalls: afterInstalls, afterOff: afterOff };
+  }, SRC);
+  check('★ 5 次重建后最多 1 个 ResizeObserver', res.afterInstalls <= 1, 'liveRO=' + res.afterInstalls);
+  check('★ 停用后灰框/模型行/档位标签全部撤掉',
+    !res.afterOff.head && !res.afterOff.modelRow && !res.afterOff.label, JSON.stringify(res.afterOff));
+  check('★ 停用后 dshp-levelPage 类清掉（选项行不再被藏）', !res.afterOff.levelPage, JSON.stringify(res.afterOff));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close();
+}
+
 await browser.close();
 console.log(failures === 0 ? '\n全部通过' : '\n失败 ' + failures + ' 项');
 process.exit(failures === 0 ? 0 : 1);
