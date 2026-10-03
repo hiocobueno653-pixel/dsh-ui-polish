@@ -1,0 +1,16 @@
+# dsh-ui-polish 的 bundle patch：安装本包后自动挂载宿主半（空实现）。
+# 全部效果由浏览器半注入的样式表实现。
+- insert:
+    - id: ui-polish
+      name: dsh-ui-polish
+      config:
+        # 关掉即整层停用（样式不注入），用于排障与 A/B。
+        enabled: true
+        # 浮层毛玻璃：菜单/选择器/右键菜单等共用宿主 MenuSurface 的浮层。
+        glass: true
+        # 底色不透明度 0~1。越大越不透明、字越清楚，越小越"透"。
+        tintAlpha: 0.76
+        # 背景模糊半径（px）。宿主自己用的是 40。
+        blurPx: 40
+        # 推理等级滑杆：把「模型选单 → 推理等级 → 4 个单选项」换成可拖动选择。
+        slider: true

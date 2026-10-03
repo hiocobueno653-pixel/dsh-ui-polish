@@ -1,0 +1,39 @@
+{
+  "name": "dsh-ui-polish",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH UI 打磨层：补上宿主漏画的浮层材质（菜单/选择器 → 毛玻璃），并留出后续界面细节修复的位置。纯 CSS，不改结构、不碰数据。",
+  "main": "./src/cordis.js",
+  "exports": {
+    ".": "./src/cordis.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-chat",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "test": "node test/freeze.browser.test.mjs && node test/glass.browser.test.mjs && node test/nav.browser.test.mjs && node test/selftest.browser.test.mjs && node test/slider.browser.test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.55.0"
+  }
+}

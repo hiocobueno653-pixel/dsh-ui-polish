@@ -1,0 +1,5 @@
+node_modules/
+_diag/
+*.bak
+*.bak-*
+package-lock.json
