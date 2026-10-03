@@ -273,6 +273,65 @@ console.log('幂等：重复装不会叠出第二条');
   await page.close();
 }
 
+console.log('等级页里混进多条滑杆时：去重而不是半套增强（真机 React 重渲染会复制插入节点）');
+{
+  /* 旧实现只处理第一条：第一条未接线被移除后，installSlider 因"已有滑杆"返回 null，
+     下面 slider.contains() 直接抛 TypeError，整轮扫描被吞 —— 灰框插了、滑杆没装。 */
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const errs = [];
+  page.on('pageerror', e => errs.push(String(e)));
+  await page.setContent(`<!doctype html><html><head><style>${cssText}
+    :root{--dsw-alias-state-business-primary:#3b82f6;--dsw-alias-bg-layer-1:#fff;}
+    body{margin:24px;font:14px system-ui}
+    [role='menuitemradio']{display:flex;width:220px;padding:8px 10px;border:0;background:none;border-radius:8px;cursor:pointer;font:inherit;text-align:left}
+  </style></head><body>
+    <div role="menu" id="menu">
+      ${['Auto', 'Low', 'High', 'Max'].map((l, i) => `<button type="button" role="menuitemradio" aria-checked="${i === 2}"><span class="modelName">${l}</span></button>`).join('')}
+    </div></body></html>`);
+  const res = await page.evaluate(src => {
+    const enhance = new Function(src + 'return enhanceModelMenu;')();
+    const menu = document.getElementById('menu');
+    const mk = (wired, id) => {
+      const d = document.createElement('div');
+      d.className = 'dshp-slider';
+      if (wired) d.dataset.dshpWired = '1';
+      d.id = id;
+      menu.appendChild(d);
+      return d;
+    };
+    /* 场景 A：两条都未接线 → 全拆重装，且不许抛 */
+    mk(false, 'a1'); mk(false, 'a2');
+    let threw = null;
+    try { enhance(menu); } catch (e) { threw = String(e && e.message || e); }
+    const afterA = {
+      threw: threw,
+      count: menu.querySelectorAll('.dshp-slider').length,
+      wired: menu.querySelector('.dshp-slider') ? menu.querySelector('.dshp-slider').dataset.dshpWired : null,
+      levelPage: menu.classList.contains('dshp-levelPage'),
+    };
+    /* 场景 B：第一条已接线、第二条是野生的 → 保留第一条（身份不变） */
+    menu.querySelectorAll('.dshp-slider').forEach(s => s.remove());
+    const keep = mk(true, 'keepme'); mk(false, 'stray');
+    let threw2 = null;
+    try { enhance(menu); } catch (e) { threw2 = String(e && e.message || e); }
+    const afterB = {
+      threw: threw2,
+      count: menu.querySelectorAll('.dshp-slider').length,
+      keptFirst: document.getElementById('keepme') === keep && keep.isConnected,
+      strayGone: !document.getElementById('stray'),
+    };
+    return { afterA: afterA, afterB: afterB };
+  }, INSTALL_SRC);
+  check('★ 两条半成品滑杆：不抛错、重装成一条接好线的、等级页标记正常',
+    res.afterA.threw === null && res.afterA.count === 1 && res.afterA.wired === '1' && res.afterA.levelPage,
+    JSON.stringify(res.afterA));
+  check('★ 一好一坏：保留接好线的那条、拆掉野生的',
+    res.afterB.threw === null && res.afterB.count === 1 && res.afterB.keptFirst && res.afterB.strayGone,
+    JSON.stringify(res.afterB));
+  check('无页面报错', errs.length === 0, errs.join('|'));
+  await page.close();
+}
+
 await browser.close();
 console.log('');
 console.log(failures ? `失败 ${failures} 项` : '全部通过：滑杆拖动预览、松手提交，且没碰别的菜单');
