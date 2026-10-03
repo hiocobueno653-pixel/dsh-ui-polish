@@ -7,6 +7,10 @@
  *      hostPane()（找 React fiber + 遍历 hook 链），主线程被占满。
  *   ② 档位名守护表叠加 —— 每 commit 一次新起一个 2.5s/40ms 的 setInterval，
  *      宿主每重建一次菜单就多留一个。
+ *   ③ 观察器泄漏 —— 触发器文案的 MutationObserver 曾经造出来就不管引用，
+ *      claimMenus 顶掉旧实例时只有主观察器被断，这个每热更新一次泄漏一个。
+ *   ④ 停用不彻底 —— enabled:false 号称"整层停用"，但以前只撤毛玻璃，
+ *      滑杆、document 桥接、导航观察器照常运行。
  */
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -184,6 +188,62 @@ console.log('3. 无档位/有档位切换仍然正确（确认没改坏导航）
     return new Promise(r => setTimeout(() => r({ pane: window.__pane }), 800));
   }, SRC);
   check('★ 有档位 → 回到滑杆页', res.pane === 'effort', 'pane=' + res.pane);
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close();
+}
+
+console.log('4. 整层停用：enabled:false 撤干净，观察器不泄漏');
+{
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const errors = [];
+  page.on('pageerror', e => errors.push(String(e)));
+  await page.setContent(`<!doctype html><html><head></head><body>
+    <div data-slot="conversation.input.model"><button title="M - High">
+      <span class="_triggerLabel_">M</span><span class="_triggerEffort_">High</span></button></div>
+    <div id="host"></div></body></html>`);
+  const res = await page.evaluate(src => {
+    /* 数"活着"的 MutationObserver：构造 +1，disconnect -1。 */
+    const RealMO = window.MutationObserver;
+    let liveMO = 0;
+    window.MutationObserver = function (cb) {
+      const real = new RealMO(cb);
+      liveMO++;
+      const d = real.disconnect.bind(real);
+      real.disconnect = function () { liveMO--; return d(); };
+      return real;
+    };
+    const lib = new Function(src + 'return { apply: apply };')();
+
+    lib.apply({ config: { enabled: true, slider: true } });
+    /* 真人第一次交互才会 arm：挂主观察器 + 触发器文案观察器。 */
+    document.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+    const armedLive = liveMO;
+
+    /* enabled:false = 整层停用，一切都要撤干净。 */
+    lib.apply({ config: { enabled: false } });
+    const afterOff = {
+      liveMO: liveMO,
+      style: !!document.querySelector('style[data-plugin]'),
+      cssClass: document.documentElement.classList.contains('dshp-css'),
+      sliderClass: document.documentElement.classList.contains('dshp-sliderOn'),
+      bridge: !!document.__dshpBridgeHandler,
+      esc: !!document.__dshpEscHandler,
+    };
+
+    /* 再启用一轮：数量必须回到 arm 时的水平，不随热更新累积。 */
+    lib.apply({ config: { enabled: true, slider: true } });
+    document.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+    const afterOn = liveMO;
+
+    window.MutationObserver = RealMO;
+    return { armedLive: armedLive, afterOff: afterOff, afterOn: afterOn };
+  }, SRC);
+  check('★ arm 后恰好两个观察器（主 + 触发器文案）', res.armedLive === 2, 'liveMO=' + res.armedLive);
+  check('★ 停用后观察器全部断开（不泄漏）', res.afterOff.liveMO === 0, 'liveMO=' + res.afterOff.liveMO);
+  check('★ 停用后样式表与类名撤干净',
+    !res.afterOff.style && !res.afterOff.cssClass && !res.afterOff.sliderClass, JSON.stringify(res.afterOff));
+  check('★ 停用后 document 桥接摘掉', !res.afterOff.bridge && !res.afterOff.esc, JSON.stringify(res.afterOff));
+  check('★ 重新启用不累积（两轮仍是 2）', res.afterOn === 2, 'liveMO=' + res.afterOn);
   check('无页面报错', errors.length === 0, errors.join('|'));
   await page.close();
 }
