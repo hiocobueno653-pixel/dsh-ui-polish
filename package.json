@@ -13,7 +13,8 @@
   "files": [
     "src",
     "lib",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "assets"
   ],
   "dsh": {
     "bundle": {
