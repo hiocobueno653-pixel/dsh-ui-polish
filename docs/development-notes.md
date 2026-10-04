@@ -527,6 +527,24 @@ CSS 里写 `translate: calc(11px + travel * t)`，
 **还有一条**：`measure()` 被连续几帧调用时，**只在值真的变化时才写 CSS 变量**。
 重复写同一个值会反复重启 CSS 过渡，滑钮要 600ms 以上才到位（实测从 600ms 降到 300ms）。
 
+## 踩坑 #19：选完一档后 3 秒内再次滑动，按钮闪烁
+
+「重开菜单顶住宿主默认档」靠一个 3 秒窗口（`pickedIndex` + `pickedUntil`）。
+窗口没关就再次拖动时，三个写入源全在跟手指抢位置：
+
+1. `pointermove` 跨档会把 `pickedIndex` 写成手指所在档（守护标签要用），
+   而宿主 aria-checked 还在旧档 → 扫描轮一比"不符"就调 `applyPicked`，
+   `paint` 把连续位置**吸附到最近刻度**，顺带把内部 `index` 改脏
+   （松手时 target === index → 提交被跳过，宿主永远停在旧档 —— fx J 复现过）；
+2. 守护表也在按上一档写 `--dshp-t`；
+3. `measure()` 被 ResizeObserver 触发时按 `preview`（整数刻度）重写 `--dshp-x`，
+   行程一变就吸附。
+
+**修法**：① `pointerdown` 整扇关窗（`pickedIndex=null`、`pickedUntil=0`）并掐掉守护表；
+② 扫描轮的 `applyPicked` 加 `isDragging` 护栏（防热更新前旧版滑杆）；
+③ `measure()` 拖动中按连续位置（读 `--dshp-t`）重算 px，非拖动才用 preview。
+原地松手（没提交）按当前档续窗，保住"重开顶住默认档"的原始语义。
+
 ## 踩坑 #18：换模型复用同一菜单节点 —— 滑杆闭包留在旧档位集
 
 宿主换模型时**不重建菜单 DOM**，React 只改行里的文字。我们那份"已接线"的滑杆于是

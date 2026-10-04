@@ -685,6 +685,79 @@ console.log('I-4. 换模型复用同一菜单节点：滑杆按新档位重装�
   await page.close(); await ctx.close();
 }
 
+console.log('J. 选完一档后 3 秒窗口内再次滑动：扫描不许把滑钮拽回档位刻度（闪烁）');
+{
+  /* 真机时序：拖到 Max 松手提交 → pickedIndex=3、3 秒窗口开启（重开菜单时
+     用它顶住宿主默认档）。窗口内用户**再次滑动**：拖动中 pickedIndex 跟着
+     手指换档，而宿主 aria-checked 还是旧档 → 扫描轮以为"滑杆停错了"，
+     调 applyPicked 把滑杆 paint 回 pickedIndex（吸附到刻度）。
+     拖动每跨一档就写 data-dshp-target → MutationObserver → 补扫 →
+     又被吸附：滑钮在"手指位置"和"最近刻度"之间来回跳 —— 按钮闪烁。 */
+  const { page, ctx, errors } = await mount({ current: 2 });
+  const res = await page.evaluate(async () => {
+    const menu = document.querySelector('[role=menu]');
+    const radios = Array.from(menu.querySelectorAll('[role=menuitemradio]'));
+    /* 模拟宿主的**异步**提交：aria-checked 30ms 后才落地（真机是一个往返）。 */
+    menu.addEventListener('click', (ev) => {
+      const r = ev.target.closest('[role=menuitemradio]');
+      if (!r) return;
+      const idx = radios.indexOf(r);
+      setTimeout(() => {
+        radios.forEach((x, i) => x.setAttribute('aria-checked', String(i === idx)));
+      }, 30);
+    });
+    const s = document.querySelector('.dshp-slider');
+    const track = s.querySelector('.dshp-sliderTrack');
+    const knob = s.querySelector('.dshp-sliderKnob');
+    const rect = track.getBoundingClientRect();
+    const kw = knob.offsetWidth || 22;
+    const travel = rect.width - kw;
+    const y = rect.top + rect.height / 2;
+    const at = (t) => ({ clientX: rect.left + kw / 2 + travel * t, clientY: y });
+    const pev = (type, t) => new PointerEvent(type, Object.assign(
+      { bubbles: true, cancelable: true, button: 0, pointerId: 1, isPrimary: true }, at(t)));
+    /* ① 先选一档：拖到 Max 松手提交，等宿主状态落地（aria-checked=3）。 */
+    track.dispatchEvent(pev('pointerdown', 1));
+    track.dispatchEvent(pev('pointerup', 1));
+    await new Promise(r2 => setTimeout(r2, 150));
+    /* ② 3 秒窗口内再次滑动：拖到 0.4（跨到第 1 档），中途插一轮扫描
+       （模拟 MutationObserver 补扫），再拖到 0.45、再扫一轮。 */
+    const seq = [];
+    const readT = () => parseFloat(s.style.getPropertyValue('--dshp-t'));
+    track.dispatchEvent(pev('pointerdown', 1));
+    track.dispatchEvent(pev('pointermove', 0.4));
+    seq.push(readT());
+    window.dshUiPolish.enhanceMenu(menu);
+    seq.push(readT());
+    track.dispatchEvent(pev('pointermove', 0.45));
+    seq.push(readT());
+    window.dshUiPolish.enhanceMenu(menu);
+    seq.push(readT());
+    /* ③ 松手在 0.4 → 应提交第 1 档（Low），一切落定。 */
+    track.dispatchEvent(pev('pointerup', 0.4));
+    await new Promise(r2 => setTimeout(r2, 500));
+    const tFinal = readT();
+    const checked = radios.map(r2 => r2.getAttribute('aria-checked') === 'true');
+    return {
+      seq,
+      tFinal,
+      checkedCount: checked.filter(Boolean).length,
+      checkedIdx: checked.indexOf(true),
+      pressed: s.classList.contains('dshp-sliderPressed') || s.classList.contains('dshp-sliderActive'),
+    };
+  });
+  check('★ 拖动中扫描不吸附：位置始终停在手指上（0.4/0.45，不许跳到 1/3 刻度）',
+    Math.abs(res.seq[0] - 0.4) < 0.02 && Math.abs(res.seq[1] - 0.4) < 0.02 &&
+    Math.abs(res.seq[2] - 0.45) < 0.02 && Math.abs(res.seq[3] - 0.45) < 0.02,
+    JSON.stringify(res.seq));
+  check('★ 松手后正常提交到手指所在档（Low）',
+    Math.abs(res.tFinal - 1 / 3) < 0.03 && res.checkedIdx === 1 && res.checkedCount === 1,
+    JSON.stringify(res));
+  check('★ 手势状态已复位（无残留按下/拖动类）', res.pressed === false, JSON.stringify(res));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
 await browser.close();
 console.log(failures ? '[fx] 失败 ' + failures + ' 项' : '[fx] 全部通过：粒子只横向流动，绽放拖到最高档才放一次，光标按图切换，触发器箭头不再闪，弹窗淡入淡出有残影兜底，只有 Max 变紫（含换模型复用节点）');
 process.exit(failures ? 1 : 0);
