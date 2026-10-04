@@ -51,6 +51,7 @@ const SHELL = `<!doctype html><html><head><style>
   <div id="host"></div></body></html>`;
 
 async function mount(opts = {}) {
+  const levels = opts.levels || LEVELS;
   const ctx = await browser.newContext({ viewport: { width: 900, height: 700 },
     reducedMotion: opts.reducedMotion });
   const page = await ctx.newPage();
@@ -70,7 +71,7 @@ async function mount(opts = {}) {
       '<button type="button" role="menuitemradio" aria-checked="' + (i === current) +
       '"><span class="optionCopy"><span class="modelName">' + l + '</span></span></button>').join('') + '</div>';
     window.dshUiPolish.enhanceMenu(host.firstElementChild);
-  }, { levels: LEVELS, current: opts.current === undefined ? 1 : opts.current });
+  }, { levels: levels, current: opts.current === undefined ? 1 : opts.current });
   await page.waitForTimeout(600);
   return { page, ctx, errors };
 }
@@ -150,10 +151,10 @@ console.log('A. 流动粒子：只沿水平方向，贴在填色里');
     const t = document.querySelector('.dshp-sliderTrack').getBoundingClientRect();
     const f = document.querySelector('.dshp-sliderFill').getBoundingClientRect();
     const k = document.querySelector('.dshp-sliderKnob').getBoundingClientRect();
-    return { fillRight: f.right, knobRight: k.right, trackRight: t.right };
+    return { fillRight: f.right, knobRight: k.right, knobCenter: k.left + k.width / 2, trackRight: t.right };
   });
-  check('★ 粒子可见范围（=填色）右端贴着滑钮、不越出轨道',
-    Math.abs(tip.fillRight - tip.knobRight) < 1.5 && tip.fillRight <= tip.trackRight + 0.6, JSON.stringify(tip));
+  check('★ 粒子可见范围（=填色）右端落在滑钮圆心、不越出轨道',
+    Math.abs(tip.fillRight - tip.knobCenter) < 1.5 && tip.fillRight <= tip.trackRight + 0.6, JSON.stringify(tip));
   /* 亮度层次：--o 分三档，才不会整条轨道九个点一样亮 */
   const tone = await page.evaluate(() => {
     const ps = Array.from(document.querySelectorAll('.dshp-p'));
@@ -441,6 +442,249 @@ console.log('G. 触发器常驻箭头：宿主可替换图标全隐藏，箭头�
   await page.close(); await ctx.close();
 }
 
+console.log('H. 弹窗淡入淡出：入场淡入 + 关闭残影');
+{
+  /* 贴近宿主真结构：MenuSurface 根带 data-menu-material，档位页时它自己
+     就是 role=menu；触发器按钮的 aria-controls 指向根的 id —— 插件按这个精确认领。 */
+  const openMenuSrc = () => {
+    document.getElementById('host').innerHTML =
+      '<div role="menu" id="menu-x" data-menu-material="translucent">' +
+      ['Off', 'Low', 'High', 'Max'].map((l, i) =>
+        '<button type="button" role="menuitemradio" aria-checked="' + (i === 2) + '">' +
+        '<span class="optionCopy"><span class="modelName">' + l + '</span></span></button>').join('') +
+      '</div>';
+    document.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+  };
+  const { page, ctx, errors } = await mount({ current: 2 });
+  await page.evaluate(({ openSrc }) => {
+    /* 重开一扇门：按钮补上 aria-controls（宿主挂载时两件事同一棵子树）。 */
+    const btn = document.querySelector("[data-slot='conversation.input.model'] button");
+    btn.setAttribute('aria-controls', 'menu-x');
+    btn.setAttribute('aria-expanded', 'true');
+    eval('(' + openSrc + ')')();
+  }, { openSrc: String(openMenuSrc) });
+  await page.waitForTimeout(60);   /* arm → rAF 补扫 → 认领 + 挂入场类 */
+  const inState = await page.evaluate(() => {
+    const surf = document.getElementById('menu-x');
+    if (!surf) return { missing: true };
+    const cs = getComputedStyle(surf);
+    return {
+      claimed: surf.dataset.dshpModelMenu === '1',
+      cls: surf.classList.contains('dshp-menuIn'),
+      anim: cs.animationName,
+      dur: cs.animationDuration,
+    };
+  });
+  check('★ 入场：模型菜单挂上 dshp-menuIn，动画真的在跑', 
+    inState.claimed && inState.cls && inState.anim === 'dshpMenuIn', JSON.stringify(inState));
+  await page.waitForTimeout(350);  /* 等入场动画结束：animationend 补记静止矩形 */
+  const rectState = await page.evaluate(() => {
+    const surf = document.getElementById('menu-x');
+    const r = surf && surf.__dshpRect;
+    return { has: !!(r && r.width > 0 && r.height > 0) };
+  });
+  check('★ 动画跑完后记下了静止矩形（残影钉回原位有依据）', rectState.has, JSON.stringify(rectState));
+  /* 模拟 React 卸载：整扇门从文档里摘掉。观察器回调里应放出残影。 */
+  await page.evaluate(() => { document.getElementById('host').innerHTML = ''; });
+  await page.waitForTimeout(30);   /* 微任务回调 + 挂上残影 */
+  const ghostState = await page.evaluate(() => {
+    const g = document.querySelector('.dshp-ghost');
+    if (!g) return { missing: true };
+    const cs = getComputedStyle(g);
+    return {
+      anim: cs.animationName,
+      role: g.getAttribute('role'),
+      hasMenuIn: g.classList.contains('dshp-menuIn'),
+      pos: g.style.position,
+      left: g.style.left,
+      z: g.style.zIndex,
+      material: g.hasAttribute('data-menu-material'),
+      anyRoleMenu: !!g.querySelector("[role='menu']"),
+    };
+  });
+  check('★ 关闭：放出淡出残影（dshpMenuOut）', ghostState.anim === 'dshpMenuOut', JSON.stringify(ghostState));
+  check('★ 残影去角色、不带入场类（扫描/动画都不会撞车）',
+    ghostState.role === null && !ghostState.hasMenuIn && !ghostState.anyRoleMenu, JSON.stringify(ghostState));
+  check('★ 残影钉回原位（fixed + 矩形兜正 + 层级压真菜单一头）',
+    ghostState.pos === 'fixed' && /px$/.test(ghostState.left) && ghostState.z === '1099', JSON.stringify(ghostState));
+  check('★ 残影留着材质属性（淡出期间毛玻璃不断）', ghostState.material === true, JSON.stringify(ghostState));
+  await page.waitForTimeout(220);  /* 180ms 后 JS 自动清除 */
+  const cleared = await page.evaluate(() => !document.querySelector('.dshp-ghost'));
+  check('★ 残影动画跑完即清除，不残留', cleared === true, String(cleared));
+  /* 遮罩闸门：导航换页（dshp-navBusy）期间整扇门关掉，不该把中间页淡出来。 */
+  await page.evaluate(({ openSrc }) => {
+    eval('(' + openSrc + ')')();
+  }, { openSrc: String(openMenuSrc) });
+  await page.waitForTimeout(350);
+  await page.evaluate(() => {
+    const surf = document.getElementById('menu-x');
+    surf.classList.add('dshp-navBusy');
+    document.getElementById('host').innerHTML = '';
+  });
+  await page.waitForTimeout(30);
+  const veiled = await page.evaluate(() => !document.querySelector('.dshp-ghost'));
+  check('★ 遮罩期关闭不放残影（不淡出用户不该看到的中间页）', veiled === true, String(veiled));
+  /* 别人的门：有材质、没认领的菜单被关，一律不碰。 */
+  await page.evaluate(() => {
+    document.getElementById('host').innerHTML =
+      '<div role="menu" id="other-menu" data-menu-material="translucent">' +
+      '<button role="menuitem">权限 A</button><button role="menuitem">权限 B</button></div>';
+    document.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+  });
+  await page.waitForTimeout(250);
+  await page.evaluate(() => { document.getElementById('host').innerHTML = ''; });
+  await page.waitForTimeout(30);
+  const foreign = await page.evaluate(() => !document.querySelector('.dshp-ghost'));
+  check('★ 非模型菜单（权限/右键）关闭不被加戏', foreign === true, String(foreign));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
+console.log('I. 只有 Max 档是紫色：顶档叫 xHigh 也不许变紫（用户要求）');
+{
+  /* 真机有一批模型的档位是 Off/Low/High/xHigh —— xHigh 是顶档但不是 Max。
+     特效（紫渐变/紫字/粒子提速/绽放）以前按"列表最后一项"判定，
+     xHigh 就跟着全套变紫。现在按档位名判定。 */
+  const { page, ctx, errors } = await mount({ levels: ['Off', 'Low', 'High', 'xHigh'], current: 1 });
+  check('★ 顶档是 xHigh 时滑杆照常装上（xHigh 必须在档位词表里，否则整页不被认成档位页）',
+    await page.evaluate(() => !!document.querySelector('.dshp-slider')));
+  const atTop = await page.evaluate(async () => {
+    const s = document.querySelector('.dshp-slider');
+    s.focus();
+    s.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true, cancelable: true }));
+    await new Promise(r => setTimeout(r, 700));
+    const label = document.querySelector('.dshp-levelLabel');
+    return {
+      top: label && label.textContent,
+      labelColor: label && getComputedStyle(label).color,
+      sliderMax: s.classList.contains('dshp-sliderMax'),
+      grad: getComputedStyle(document.querySelector('.dshp-sliderFill'), '::before').opacity,
+      burst: document.getAnimations().filter(a => {
+        const t = a.effect && a.effect.target;
+        return t && /dshp-burst/.test(t.className || '');
+      }).length,
+      knobShadow: getComputedStyle(document.querySelector('.dshp-sliderKnob')).boxShadow,
+    };
+  });
+  check('★ xHigh 顶档：不带 Max 特效（无紫色类）', atTop.sliderMax === false, JSON.stringify(atTop));
+  check('★ xHigh 顶档：档位名仍是主题蓝，不是紫',
+    /59, 130, 246/.test(atTop.labelColor || ''), atTop.labelColor);
+  check('★ xHigh 顶档：紫色渐变不亮、滑钮无紫晕、不绽放',
+    atTop.grad === '0' && !/139, 92, 246/.test(atTop.knobShadow) && atTop.burst === 0,
+    JSON.stringify({ grad: atTop.grad, shadow: atTop.knobShadow, burst: atTop.burst }));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
+console.log('I-2. 真 Max 档：紫色特效齐全（顶部档位名是滑杆的兄弟节点，靠 :has 连上）');
+{
+  const { page, ctx, errors } = await mount({ current: 1 });
+  const atMax = await page.evaluate(async () => {
+    const s = document.querySelector('.dshp-slider');
+    s.focus();
+    s.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true, cancelable: true }));
+    await new Promise(r => setTimeout(r, 700));
+    const label = document.querySelector('.dshp-levelLabel');
+    return {
+      top: label && label.textContent,
+      labelColor: label && getComputedStyle(label).color,
+      sliderMax: s.classList.contains('dshp-sliderMax'),
+      grad: getComputedStyle(document.querySelector('.dshp-sliderFill'), '::before').opacity,
+    };
+  });
+  check('★ Max 顶档：紫色类 + 渐变 + 档位名变紫',
+    atMax.sliderMax === true && atMax.grad === '1' && /139, 92, 246/.test(atMax.labelColor || ''),
+    JSON.stringify(atMax));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
+console.log('I-3. 中文档位「最大」同样认作 Max');
+{
+  const { page, ctx, errors } = await mount({ levels: ['关闭', '低', '中', '最大'], current: 1 });
+  const atMax = await page.evaluate(async () => {
+    const s = document.querySelector('.dshp-slider');
+    if (!s) return { missing: true };
+    s.focus();
+    s.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true, cancelable: true }));
+    await new Promise(r => setTimeout(r, 700));
+    const label = document.querySelector('.dshp-levelLabel');
+    return {
+      sliderMax: s.classList.contains('dshp-sliderMax'),
+      labelColor: label && getComputedStyle(label).color,
+    };
+  });
+  check('★ 「最大」被认成 Max 档（紫色类 + 紫字）',
+    atMax.sliderMax === true && /139, 92, 246/.test(atMax.labelColor || ''),
+    JSON.stringify(atMax));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
+console.log('I-4. 换模型复用同一菜单节点：滑杆按新档位重装（Max 特效不跟着旧模型留）');
+{
+  /* 宿主换模型常常**复用同一个菜单节点**：React 只改行里的文字。
+     旧版那份"已接线"滑杆留着上一个模型的闭包（labels/maxIndex/刻点），
+     于是上一个模型有 Max、这一个顶档是 xHigh 时，xHigh 照样变紫。
+     现在档位签名变了就拆掉重装。 */
+  const { page, ctx, errors } = await mount({ current: 3 });
+  const before = await page.evaluate(() => {
+    const s = document.querySelector('.dshp-slider');
+    return { sig: s && s.dataset.dshpSig, max: s && s.classList.contains('dshp-sliderMax') };
+  });
+  check('★ 装好时记下档位签名，Max 顶档带紫色类',
+    before.max === true && /Max$/.test(before.sig || ''), JSON.stringify(before));
+  /* 原地把档位换成 xHigh 顶档（同一批 DOM 节点，只是文字变了）→ 触发一轮扫描。 */
+  const after = await page.evaluate(async () => {
+    const menu = document.querySelector('[role=menu]');
+    const radios = Array.from(menu.querySelectorAll('[role=menuitemradio]'));
+    const names = ['Off', 'Low', 'High', 'xHigh'];
+    radios.forEach((r, i) => {
+      const nm = r.querySelector('.modelName');
+      if (nm) nm.textContent = names[i];
+    });
+    /* 第 3 档（新集合的顶档）设为选中，模拟换模型后的真实档位 */
+    radios.forEach((r, i) => r.setAttribute('aria-checked', String(i === 3)));
+    window.dshUiPolish.enhanceMenu(menu);
+    await new Promise(r => setTimeout(r, 250));
+    const s = document.querySelector('.dshp-slider');
+    const label = document.querySelector('.dshp-levelLabel');
+    return {
+      exists: !!s,
+      sig: s && s.dataset.dshpSig,
+      max: s && s.classList.contains('dshp-sliderMax'),
+      dots: s ? s.querySelectorAll('.dshp-sliderDot').length : 0,
+      top: label && label.textContent,
+      labelColor: label && getComputedStyle(label).color,
+    };
+  });
+  check('★ 换档后滑杆重装（签名跟着新档位）',
+    after.exists === true && /xHigh$/.test(after.sig || ''), JSON.stringify(after));
+  check('★ 顶档 xHigh 不再残留 Max 紫（紫色类已摘、档位名仍是蓝）',
+    after.max === false && /59, 130, 246/.test(after.labelColor || '') && after.top === 'xHigh',
+    JSON.stringify(after));
+  /* 档位数变了（4 → 3）：刻点必须重生成，不能留 4 个点。 */
+  const countChange = await page.evaluate(async () => {
+    const menu = document.querySelector('[role=menu]');
+    const radios = Array.from(menu.querySelectorAll('[role=menuitemradio]'));
+    radios[3].remove();
+    window.dshUiPolish.enhanceMenu(menu);
+    await new Promise(r => setTimeout(r, 250));
+    const s = document.querySelector('.dshp-slider');
+    return {
+      sig: s && s.dataset.dshpSig,
+      dots: s ? s.querySelectorAll('.dshp-sliderDot').length : 0,
+      max: s && s.classList.contains('dshp-sliderMax'),
+      valuemax: s && s.getAttribute('aria-valuemax'),
+    };
+  });
+  check('★ 档位数变化时刻点与行程上限一起重算（3 档）',
+    countChange.dots === 3 && countChange.valuemax === '2' && countChange.max === false,
+    JSON.stringify(countChange));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
 await browser.close();
-console.log(failures ? '[fx] 失败 ' + failures + ' 项' : '[fx] 全部通过：粒子只横向流动，绽放拖到最高档才放一次，光标按图切换，触发器箭头不再闪');
+console.log(failures ? '[fx] 失败 ' + failures + ' 项' : '[fx] 全部通过：粒子只横向流动，绽放拖到最高档才放一次，光标按图切换，触发器箭头不再闪，弹窗淡入淡出有残影兜底，只有 Max 变紫（含换模型复用节点）');
 process.exit(failures ? 1 : 0);

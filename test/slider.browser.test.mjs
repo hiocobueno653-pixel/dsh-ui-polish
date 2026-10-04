@@ -64,8 +64,14 @@ const check = (name, ok, detail) => {
 const LEVELS = ['Auto', 'Low', 'High', 'Max'];
 async function mountMenu(opts = {}) {
   const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  /* 主题变量：浅色一套、深色一套（和 glass 套件同款模拟）。
+     深色的关键点：bg-layer-1 是深灰 —— 滑钮以前跟着它走，整颗钮沉进
+     深色毛玻璃里看不见（用户要求深色下也要白色）。 */
+  const themeVars = opts.dark
+    ? '--dsw-alias-state-business-primary:#3b82f6;--dsw-alias-bg-layer-2:#2c2c2f;--dsw-alias-bg-layer-1:#232326;--dsw-alias-label-primary:#f5f5f7;'
+    : '--dsw-alias-state-business-primary:#3b82f6;--dsw-alias-bg-layer-2:#ececf0;--dsw-alias-bg-layer-1:#fff;--dsw-alias-label-primary:#111114;';
   await page.setContent(`<!doctype html><html><head><style>${cssText}
-    :root{--dsw-alias-state-business-primary:#3b82f6;--dsw-alias-bg-layer-2:#ececf0;--dsw-alias-bg-layer-1:#fff;}
+    :root{${themeVars}}
     body{margin:24px;font:14px system-ui}
     [role='menuitemradio']{display:flex;width:220px;padding:8px 10px;border:0;background:none;border-radius:8px;cursor:pointer;font:inherit;text-align:left}
   </style></head><body>
@@ -94,7 +100,17 @@ async function mountMenu(opts = {}) {
     const k = document.querySelector('.dshp-sliderKnob');
     const s = document.querySelector('.dshp-slider');
     if (!k || !s) return false;
-    const x = parseFloat(s.style.getPropertyValue('--dshp-x')) || 0;
+    /* ⚠️ 这里必须等"真正落位"，不能只比 x 和 transform：刚装上时 --dshp-x 是空串
+       （parseFloat('')||0 = 0），transform 也是 0，两者"相等"会被当成已稳定 —— 而这时
+       dshp-first 还挂着（transition:none），换档会**瞬移**而不是滑行，
+       后面"摘除时应在半途"的前提就永远成立不了（实测 oldX 直接落在目标档）。
+       所以：过渡已放开（无 dshp-first）+ 轨道已量到（travel>0）+ 位置已追平。 */
+    if (s.classList.contains('dshp-first')) return false;
+    const xRaw = s.style.getPropertyValue('--dshp-x');
+    if (xRaw === '') return false;
+    const x = parseFloat(xRaw) || 0;
+    const travel = parseFloat(s.style.getPropertyValue('--dshp-travel')) || 0;
+    if (travel <= 0) return false;
     const m = /matrix\(([^)]+)\)/.exec(getComputedStyle(k).transform);
     if (!m) return false;
     const parts = m[1].split(',').map(v => parseFloat(v.trim()));
@@ -126,9 +142,12 @@ console.log('装上了吗');
   const expectedCenter = geo.left + 11 + (geo.track - 22) * (2 / 3);
   check('滑钮停在 2/3 处（第 3/4 档）', Math.abs(geo.knobCenter - expectedCenter) < 1.5,
     `knob ${geo.knobCenter.toFixed(1)} vs ${expectedCenter.toFixed(1)}`);
-  /* 填色盖到滑钮**右缘**（不是圆心）：盖到圆心时滑钮右半边压在空轨道上，
-     最右档看着就是"右边没填满"（用户反馈）。 */
-  check('填充右缘与滑钮右缘对齐', Math.abs(geo.fillRight - geo.knobRight) < 1.5, `${geo.fillRight.toFixed(1)} vs ${geo.knobRight.toFixed(1)}`);
+  /* 填色盖到滑钮**圆心**：滑钮是圆的，填到右缘时那条被 scaleX 压出的直边会在
+     上下边缘处超出圆的收边，蓝色从滑钮右肩露出来（用户截图）。填到圆心则直边
+     永远藏在钮最宽处底下。最右档另有吸附铺满（见下方 Max 档用例）。 */
+  check('填充右缘落在滑钮圆心（不越出、不露肩）',
+    Math.abs(geo.fillRight - geo.knobCenter) < 1.5 && geo.fillRight <= geo.knobRight + 0.5,
+    `fill ${geo.fillRight.toFixed(1)} vs center ${geo.knobCenter.toFixed(1)} / right ${geo.knobRight.toFixed(1)}`);
   await page.close();
 }
 
@@ -213,6 +232,45 @@ console.log('原本就在最右档时打开：填色要铺满（用户报的场�
   check('★ 最右档：填色铺满到轨道右端（右边不露灰）',
     Math.abs(geoMax.fillRight - geoMax.trackRight) < 1.5 && Math.abs(geoMax.knobRight - geoMax.trackRight) < 1.5,
     JSON.stringify(geoMax));
+  await page.close();
+}
+
+console.log('深色主题：滑钮仍白、轨道仍可见（用户要求深色下按钮也是白色）');
+{
+  /* 夹具里的 bg-layer-1 = #232326（宿主深色同款）、label-primary 反相为近白。
+     以前 --dshp-knob 绑 bg-layer-1：深色下钮变深灰，几乎和轨道同色看不见。 */
+  const { page } = await mountMenu({ current: 1, dark: true });
+  const colors = await page.evaluate(() => {
+    /* 通道提取要兼容两种序列化：rgba(…) 和 Chrome 对带 alpha 的 color-mix
+       原样保留的 color(srgb r g b / a)（0~1 通道，×255 归一）。 */
+    const chans = str => {
+      let m = /rgba?\(([^)]+)\)/.exec(str);
+      if (m) return m[1].split(',').slice(0, 3).map(v => parseFloat(v.trim()));
+      m = /color\(srgb ([\d.]+) ([\d.]+) ([\d.]+)(?: \/ ([\d.]+))?\)/.exec(str);
+      if (m) return [parseFloat(m[1]) * 255, parseFloat(m[2]) * 255, parseFloat(m[3]) * 255];
+      return null;
+    };
+    const s = document.querySelector('.dshp-slider');
+    const cs = getComputedStyle(s);
+    return {
+      knob: chans(getComputedStyle(document.querySelector('.dshp-sliderKnob')).backgroundColor),
+      track: chans(getComputedStyle(document.querySelector('.dshp-sliderTrack')).backgroundColor),
+      /* --dshp-knob 写在样式表（.dshp-slider 规则）里，不在内联 style 上：
+         必须用 getComputedStyle 读。 */
+      knobVar: (cs.getPropertyValue('--dshp-knob') || '').trim(),
+    };
+  });
+  const whiteish = c => !!c && c[0] >= 250 && c[1] >= 250 && c[2] >= 250;
+  check('★ 深色下滑钮仍是纯白', whiteish(colors.knob), JSON.stringify(colors.knob));
+  /* 轨道 = 文字色(深色主题下是 #f5f5f7) 13% + 透明：alpha 混在通道里，
+     RGB 通道仍是浅色 —— 这正是"深色下轨道和深灰玻璃底分得开"的机制。
+     阈值 180：要防的回归是把它改回 bg-layer-2（深色下 = 44,44,47 的深灰，轨道消失），
+     而不是要求它等于纯白。 */
+  check('★ 深色下轨道用的是反相后的浅色通道（不沉底）', (() => {
+    const c = colors.track;
+    return !!c && c[0] >= 180 && c[1] >= 180 && c[2] >= 180;
+  })(), JSON.stringify(colors.track));
+  check('★ --dshp-knob 已固定为 #fff（不再跟 bg-layer-1）', colors.knobVar === '#fff', colors.knobVar);
   await page.close();
 }
 
@@ -332,8 +390,121 @@ console.log('等级页里混进多条滑杆时：去重而不是半套增强（�
   await page.close();
 }
 
+console.log('飞行交接：滑行半途滑杆被宿主重建时，动画接得上（不瞬移、不闪回、不叠影）');
+{
+  /* 键盘换档 1→2：滑钮从 1/3 行程向 2/3 滑行（380ms 过渡）。
+     滑行半途把滑杆整个摘掉再重装 —— 模拟宿主重渲染对滑杆节点的重建。
+     radio 的 aria-checked 仍是旧档（宿主异步往返还没回包），这正是
+     "闪回旧档"的源头；旧节点的滑行则会被拦腰砍成硬切。 */
+  const { page } = await mountMenu({ current: 1 });
+  /* ⚠️ 夹具没有 React fiber，commit 会走 radio.click() 退路、把整个菜单摘掉；
+     真机走的是 select()，菜单不关（半途重建恰恰发生在"菜单还开着"的时候）。
+     实例属性盖掉原型方法：只让"这扇门"的 remove 变空转，radio 上的监听
+     不用动（滑杆闭包还握着原 radio 的引用，换节点反而会把联动拆散）。 */
+  await page.evaluate(() => {
+    const menu = document.getElementById('menu');
+    menu.remove = function () {};
+  });
+  await page.evaluate(() => {
+    document.querySelector('.dshp-slider')
+      .dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+  });
+  await page.waitForTimeout(120);   /* 滑行到约 1/3 程（380ms 曲线的半途区） */
+  const f1 = await page.evaluate(async () => {
+    const menu = document.getElementById('menu');
+    const tx = el => {
+      const m = /matrix\(([^)]+)\)/.exec(getComputedStyle(el).transform);
+      return m ? parseFloat(m[1].split(',')[4]) : 0;
+    };
+    const old = menu.querySelector('.dshp-slider');
+    const oldX = tx(old.querySelector('.dshp-sliderKnob'));
+    old.remove();                     /* React 摘掉旧节点 */
+    const s2 = window.__installSlider(menu);   /* ……并在下一帧装上新的 */
+    if (!s2) throw new Error('重装失败');
+    const travel = parseFloat(s2.style.getPropertyValue('--dshp-travel'));
+    const firstX = parseFloat(s2.style.getPropertyValue('--dshp-x'));
+    const samples = [];
+    for (let i = 0; i < 30; i++) {    /* ~500ms：盖住交接放行 + 补完滑行 + 时长收回 */
+      await new Promise(r => requestAnimationFrame(r));
+      const k = s2.querySelector('.dshp-sliderKnob');
+      if (k) samples.push(tx(k));
+    }
+    return {
+      travel, oldX, firstX, count: menu.querySelectorAll('.dshp-slider').length,
+      min: Math.min.apply(null, samples), last: samples[samples.length - 1],
+      dur: s2.style.getPropertyValue('--dshp-dur'),
+    };
+  });
+  const from1 = f1.travel / 3, to1 = f1.travel * 2 / 3;
+  const fmt = v => Number(v.toFixed(1));
+  check('★ 前提：摘除瞬间旧滑钮确实在半途',
+    f1.oldX > from1 + 3 && f1.oldX < to1 - 3,
+    `oldX=${fmt(f1.oldX)} from=${fmt(from1)} to=${fmt(to1)}`);
+  /* 第一帧必须仍在半途带内：贴回旧档(from1)=闪回，贴到目标(to1)=硬切瞬移。
+     带内沿留 8% 行程的余量 —— JS 飞行曲线是宿主回弹曲线的近似，
+     两者对不上半档以内是正常的，别把断言卡在执行时序上。 */
+  check('★ 重建第一帧落在半途带内（不闪回旧档、不瞬移到目标）',
+    f1.firstX > from1 + f1.travel * 0.08 && f1.firstX < to1 - f1.travel * 0.08,
+    `firstX=${fmt(f1.firstX)} band=(${fmt(from1 + f1.travel * 0.08)},${fmt(to1 - f1.travel * 0.08)}) oldX=${fmt(f1.oldX)}`);
+  check('★ 补完滑行不闪回（全程不低于换档前的旧档位）',
+    f1.min >= from1 - 2.5, `min=${fmt(f1.min)} from=${fmt(from1)}`);
+  check('★ 补完滑行落到目标档', Math.abs(f1.last - to1) <= 1.5,
+    `last=${fmt(f1.last)} to=${fmt(to1)}`);
+  check('★ 交接临时时长用完即收回（--dshp-dur 不残留，之后的换档不会被"动画忽快"污染）',
+    f1.dur === '', String(f1.dur));
+  check('★ 重建不叠影：菜单里仍只有一条滑杆', f1.count === 1, String(f1.count));
+
+  /* 二次交接：接棒的补完段里**再**重建一次（这回奔 Max）。
+     飞行记录/认领必须各按各的剩余时长走，否则越接越慢或越接越快；
+     Max 档还要验证补完后填色吸附铺满（--dshp-sx=1）。 */
+  await page.evaluate(() => {
+    document.querySelector('.dshp-slider')
+      .dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+  });
+  await page.waitForTimeout(90);
+  const f2 = await page.evaluate(async () => {
+    const menu = document.getElementById('menu');
+    const tx = el => {
+      const m = /matrix\(([^)]+)\)/.exec(getComputedStyle(el).transform);
+      return m ? parseFloat(m[1].split(',')[4]) : 0;
+    };
+    const old = menu.querySelector('.dshp-slider');
+    const oldX = tx(old.querySelector('.dshp-sliderKnob'));
+    old.remove();
+    const s3 = window.__installSlider(menu);
+    if (!s3) throw new Error('二次重装失败');
+    const travel = parseFloat(s3.style.getPropertyValue('--dshp-travel'));
+    const firstX = parseFloat(s3.style.getPropertyValue('--dshp-x'));
+    const samples = [];
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => requestAnimationFrame(r));
+      const k = s3.querySelector('.dshp-sliderKnob');
+      if (k) samples.push(tx(k));
+    }
+    return {
+      travel, oldX, firstX,
+      last: samples[samples.length - 1],
+      sx: parseFloat(s3.style.getPropertyValue('--dshp-sx')),
+      dur: s3.style.getPropertyValue('--dshp-dur'),
+      count: menu.querySelectorAll('.dshp-slider').length,
+    };
+  });
+  check('★ 前提：第二次摘除时确实在 2/3→满程的半途',
+    f2.oldX > f2.travel * (2 / 3) + 3 && f2.oldX < f2.travel - 3,
+    `oldX=${fmt(f2.oldX)} travel=${fmt(f2.travel)}`);
+  check('★ 连续两次重建仍接得上：第一帧落在半途带内',
+    f2.firstX > f2.travel * (2 / 3 + 0.08) && f2.firstX < f2.travel * (1 - 0.08),
+    `firstX=${fmt(f2.firstX)} travel=${fmt(f2.travel)} oldX=${fmt(f2.oldX)}`);
+  check('★ 二次交接落到 Max 且填色铺满（补完段时长不越接越慢）',
+    Math.abs(f2.last - f2.travel) <= 1.5 && f2.sx === 1,
+    `last=${fmt(f2.last)} travel=${fmt(f2.travel)} sx=${f2.sx}`);
+  check('★ 二次交接后临时时长同样收回、不叠影',
+    f2.dur === '' && f2.count === 1, `dur=${f2.dur} count=${f2.count}`);
+  await page.close();
+}
+
 await browser.close();
 console.log('');
-console.log(failures ? `失败 ${failures} 项` : '全部通过：滑杆拖动预览、松手提交，且没碰别的菜单');
+console.log(failures ? `失败 ${failures} 项` : '全部通过：滑杆拖动预览、松手提交、半途重建动画接得上，且没碰别的菜单');
 process.exit(failures ? 1 : 0);
 
