@@ -758,6 +758,244 @@ console.log('J. 选完一档后 3 秒窗口内再次滑动：扫描不许把滑�
   await page.close(); await ctx.close();
 }
 
+console.log('J-2. 跨多档连续拖动 + 每帧间插扫描（真机 150ms 自检节律）：全程不许吸附刻度');
+{
+  const { page, ctx, errors } = await mount({ current: 0 });
+  const res = await page.evaluate(async () => {
+    const menu = document.querySelector('[role=menu]');
+    const radios = Array.from(menu.querySelectorAll('[role=menuitemradio]'));
+    /* 宿主异步提交：aria-checked 30ms 后才落地 */
+    menu.addEventListener('click', (ev) => {
+      const r = ev.target.closest('[role=menuitemradio]');
+      if (!r) return;
+      const idx = radios.indexOf(r);
+      setTimeout(() => {
+        radios.forEach((x, i) => x.setAttribute('aria-checked', String(i === idx)));
+      }, 30);
+    });
+    const s = document.querySelector('.dshp-slider');
+    const track = s.querySelector('.dshp-sliderTrack');
+    const knob = s.querySelector('.dshp-sliderKnob');
+    const rect = track.getBoundingClientRect();
+    const kw = knob.offsetWidth || 22;
+    const travel = rect.width - kw;
+    const y = rect.top + rect.height / 2;
+    const at = (t) => ({ clientX: rect.left + kw / 2 + travel * t, clientY: y });
+    const pev = (type, t) => new PointerEvent(type, Object.assign(
+      { bubbles: true, cancelable: true, button: 0, pointerId: 1, isPrimary: true }, at(t)));
+    const readT = () => parseFloat(s.style.getPropertyValue('--dshp-t'));
+    /* 先在档位 0 原地提交一次（模拟"点选了一档"）：按下在最左端、松手 →
+       target(0) === index(0) → 走"原地松手"分支续窗。 */
+    track.dispatchEvent(pev('pointerdown', 0));
+    track.dispatchEvent(pev('pointerup', 0));
+    await new Promise(r2 => setTimeout(r2, 120));
+    /* 窗口开着，跨档慢拖：0.1 → 0.9，每动一步插一轮扫描。
+       有吸附 bug 时，每个扫描点都会被拽到最近刻度（0.333/0.667）。 */
+    const steps = [0.1, 0.25, 0.4, 0.55, 0.7, 0.85, 0.95];
+    const pairs = [];
+    track.dispatchEvent(pev('pointerdown', 0));
+    for (const t of steps) {
+      track.dispatchEvent(pev('pointermove', t));
+      const a = readT();
+      window.dshUiPolish.enhanceMenu(menu);
+      pairs.push([t, a, readT()]);
+    }
+    track.dispatchEvent(pev('pointerup', 0.95));
+    await new Promise(r2 => setTimeout(r2, 500));
+    return {
+      pairs,
+      finalT: readT(),
+      checkedIdx: radios.map(r2 => r2.getAttribute('aria-checked') === 'true').indexOf(true),
+      valuenow: s.getAttribute('aria-valuenow'),
+    };
+  });
+  const drift = res.pairs.map(p => Math.abs(p[2] - p[0])).filter(d => d > 0.02);
+  check('★ 七步慢拖全程跟手：扫描后位置仍在手指上（不许跳到刻度）',
+    drift.length === 0, JSON.stringify(res.pairs));
+  check('★ 松手提交落在手指档位（Max），宿主状态同步',
+    Math.abs(res.finalT - 1) < 0.02 && res.checkedIdx === 3 && res.valuenow === '3',
+    JSON.stringify(res));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
+console.log('K. 「重开顶住宿主默认档」的 3 秒窗口仍然有效（J 的改动不许把它削掉）');
+{
+  /* commit 之后宿主要重渲染，那一两轮里 aria-checked 可能还是**换模型前的默认档**。
+     窗口内的扫描必须以用户刚提交的档位为准，不能把滑杆拽回宿主默认值。
+     按下关窗（J 的修法）只该关掉「手势期间」的吸附，不该破坏这个语义。 */
+  const { page, ctx, errors } = await mount({ current: 1 });
+  const res = await page.evaluate(async () => {
+    const menu = document.querySelector('[role=menu]');
+    const radios = Array.from(menu.querySelectorAll('[role=menuitemradio]'));
+    const s = document.querySelector('.dshp-slider');
+    const track = s.querySelector('.dshp-sliderTrack');
+    const knob = s.querySelector('.dshp-sliderKnob');
+    const rect = track.getBoundingClientRect();
+    const kw = knob.offsetWidth || 22;
+    const travel = rect.width - kw;
+    const y = rect.top + rect.height / 2;
+    const at = (t) => ({ clientX: rect.left + kw / 2 + travel * t, clientY: y });
+    const pev = (type, t) => new PointerEvent(type, Object.assign(
+      { bubbles: true, cancelable: true, button: 0, pointerId: 1, isPrimary: true }, at(t)));
+    /* 拖到 Max 提交（夹具没有 React select → 走 radio.click 退路）。 */
+    track.dispatchEvent(pev('pointerdown', 1));
+    track.dispatchEvent(pev('pointerup', 1));
+    await new Promise(r2 => setTimeout(r2, 120));
+    /* 模拟宿主重渲染把状态打回默认档（第 1 档 Low）。 */
+    radios.forEach((x, i) => x.setAttribute('aria-checked', String(i === 1)));
+    window.dshUiPolish.enhanceMenu(menu);
+    await new Promise(r2 => setTimeout(r2, 80));
+    const label = document.querySelector('.dshp-levelLabel');
+    const held = {
+      t: parseFloat(s.style.getPropertyValue('--dshp-t')),
+      valuenow: s.getAttribute('aria-valuenow'),
+      top: label && label.textContent,
+    };
+    /* 窗口过期后（把 pickedUntil 视为已过：等 3.2s 太久，这里直接验证
+       「原地松手续窗」也成立：轻点同一档不提交，但窗口要续上，
+       随后宿主状态被重渲染打回默认档时滑杆仍停在原档）。 */
+    track.dispatchEvent(pev('pointerdown', 1));
+    track.dispatchEvent(pev('pointerup', 1));   /* 原地松手（Max）→ 续窗 */
+    radios.forEach((x, i) => x.setAttribute('aria-checked', String(i === 1)));
+    window.dshUiPolish.enhanceMenu(menu);
+    await new Promise(r2 => setTimeout(r2, 80));
+    const again = {
+      t: parseFloat(s.style.getPropertyValue('--dshp-t')),
+      valuenow: s.getAttribute('aria-valuenow'),
+    };
+    return { held, again };
+  });
+  check('★ 提交后宿主被打回默认档：窗口内滑杆仍停在 Max（不被拽回）',
+    Math.abs(res.held.t - 1) < 0.02 && res.held.valuenow === '3' && res.held.top === 'Max',
+    JSON.stringify(res.held));
+  check('★ 原地松手续窗：轻点同一档后仍顶住宿主默认档',
+    Math.abs(res.again.t - 1) < 0.02 && res.again.valuenow === '3',
+    JSON.stringify(res.again));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
+console.log('J-3. 手势被系统取消（pointercancel）后：滑杆不许被宿主的滞后状态来回拽');
+{
+  /* 按下即关窗（J 的修法）之后，若这次手势**没有提交**就结束，窗口必须按
+     最后一次真实档位重新续上 —— 否则下一轮扫描一看 settled 就拿 aria-checked
+     回写，而宿主这次往返还没落地（下面把延迟拉到 300ms 复刻真机），
+     滑杆先被拽回旧档、宿主落地再被拽回来：同一种来回弹。 */
+  const { page, ctx, errors } = await mount({ current: 1 });
+  const res = await page.evaluate(async () => {
+    const menu = document.querySelector('[role=menu]');
+    const radios = Array.from(menu.querySelectorAll('[role=menuitemradio]'));
+    menu.addEventListener('click', (ev) => {
+      const r = ev.target.closest('[role=menuitemradio]');
+      if (!r) return;
+      const idx = radios.indexOf(r);
+      setTimeout(() => {
+        radios.forEach((x, i) => x.setAttribute('aria-checked', String(i === idx)));
+      }, 300);   /* 宿主往返很慢 */
+    });
+    const s = document.querySelector('.dshp-slider');
+    const track = s.querySelector('.dshp-sliderTrack');
+    const knob = s.querySelector('.dshp-sliderKnob');
+    const rect = track.getBoundingClientRect();
+    const kw = knob.offsetWidth || 22;
+    const travel = rect.width - kw;
+    const y = rect.top + rect.height / 2;
+    const at = (t) => ({ clientX: rect.left + kw / 2 + travel * t, clientY: y });
+    const pev = (type, t) => new PointerEvent(type, Object.assign(
+      { bubbles: true, cancelable: true, button: 0, pointerId: 1, isPrimary: true }, at(t)));
+    const readT = () => parseFloat(s.style.getPropertyValue('--dshp-t'));
+    /* ① 拖到 Max 松手提交（宿主 300ms 后才落地）。 */
+    track.dispatchEvent(pev('pointerdown', 1));
+    track.dispatchEvent(pev('pointerup', 1));
+    /* ② 立刻再按一次，然后手势被系统取消（没有提交）。 */
+    track.dispatchEvent(pev('pointerdown', 0.6));
+    track.dispatchEvent(pev('pointercancel', 0.6));
+    /* 取消后紧跟一轮扫描：真机必然发生（React 重渲染 + 150ms 自检）。 */
+    window.dshUiPolish.enhanceMenu(menu);
+    const tAfterCancel = readT();
+    const valuenow = s.getAttribute('aria-valuenow');
+    await new Promise(r2 => setTimeout(r2, 450));
+    return { tAfterCancel, valuenow, tSettled: readT() };
+  });
+  check('★ 取消手势后扫描不把滑杆拽回旧档（仍在 Max，档位读数=3）',
+    Math.abs(res.tAfterCancel - 1) < 0.02 && res.valuenow === '3',
+    JSON.stringify(res));
+  check('★ 宿主落地后位置一致（没有来回弹）',
+    Math.abs(res.tSettled - 1) < 0.02, JSON.stringify(res));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
+console.log('J-4. 指针中途被宿主抢走（lostpointercapture）：手势必须收尾，不许卡住');
+{
+  /* 按下时我们抓了指针（setPointerCapture）；宿主重排把我们摘下时浏览器只发
+     lostpointercapture —— 以前没接它：dragging 和按压/抓握类名永远留着，滑钮卡在
+     放大态、光标卡在抓握，滑杆签名重装也被类名护栏挡住（换模型会留着旧档位滑杆），
+     扫描轮的 isDragging 护栏还会一直误判"用户正拖着"。 */
+  const { page, ctx, errors } = await mount({ current: 1 });
+  const res = await page.evaluate(async () => {
+    const menu = document.querySelector('[role=menu]');
+    const radios = Array.from(menu.querySelectorAll('[role=menuitemradio]'));
+    menu.addEventListener('click', (ev) => {
+      const r = ev.target.closest('[role=menuitemradio]');
+      if (!r) return;
+      const idx = radios.indexOf(r);
+      setTimeout(() => {
+        radios.forEach((x, i) => x.setAttribute('aria-checked', String(i === idx)));
+      }, 300);   /* 宿主往返很慢 */
+    });
+    const s = document.querySelector('.dshp-slider');
+    const track = s.querySelector('.dshp-sliderTrack');
+    const knob = s.querySelector('.dshp-sliderKnob');
+    const rect = track.getBoundingClientRect();
+    const kw = knob.offsetWidth || 22;
+    const travel = rect.width - kw;
+    const y = rect.top + rect.height / 2;
+    const at = (t) => ({ clientX: rect.left + kw / 2 + travel * t, clientY: y });
+    const pev = (type, t) => new PointerEvent(type, Object.assign(
+      { bubbles: true, cancelable: true, button: 0, pointerId: 1, isPrimary: true }, at(t)));
+    const lost = () => track.dispatchEvent(new PointerEvent('lostpointercapture', Object.assign(
+      { bubbles: true, cancelable: true, pointerId: 1, isPrimary: true }, at(0.5))));
+    const readT = () => parseFloat(s.style.getPropertyValue('--dshp-t'));
+    /* ① 先正常提交一档 Max（300ms 后宿主落地）。 */
+    track.dispatchEvent(pev('pointerdown', 1));
+    track.dispatchEvent(pev('pointerup', 1));
+    await new Promise(r2 => setTimeout(r2, 400));
+    /* ② 再次按下、真的拖起来（进入抓握态）。 */
+    track.dispatchEvent(pev('pointerdown', 0.45));
+    track.dispatchEvent(pev('pointermove', 0.5));
+    const activeBefore = s.classList.contains('dshp-sliderActive');
+    /* ③ 手势被宿主抢走：只有 lostpointercapture，没有 pointerup / pointercancel。 */
+    lost();
+    window.dshUiPolish.enhanceMenu(menu);
+    const out = {
+      activeBefore,
+      activeAfter: s.classList.contains('dshp-sliderActive'),
+      pressedAfter: s.classList.contains('dshp-sliderPressed'),
+      tAfterLost: readT(),
+      valuenow: s.getAttribute('aria-valuenow'),
+    };
+    await new Promise(r2 => setTimeout(r2, 450));
+    /* 迟到的第二次 lostpointercapture（真实 pointerup 后浏览器也会补发一个）：
+       dragging 已 false，必须空转，不许把滑杆或窗口状态再动一下。 */
+    lost();
+    window.dshUiPolish.enhanceMenu(menu);
+    out.tSettled = readT();
+    out.valuenowSettled = s.getAttribute('aria-valuenow');
+    return out;
+  });
+  check('★ 前提成立：抢走时确实在抓握态', res.activeBefore === true, JSON.stringify(res));
+  check('★ lostpointercapture 后彻底收尾（无残留按压/抓握类名）',
+    res.activeAfter === false && res.pressedAfter === false, JSON.stringify(res));
+  check('★ 被抢走的手势作废：滑杆回当前档 Max，档位读数=3',
+    Math.abs(res.tAfterLost - 1) < 0.02 && res.valuenow === '3', JSON.stringify(res));
+  check('★ 迟到的重复事件空转：位置与读数不动（来回弹消掉）',
+    Math.abs(res.tSettled - 1) < 0.02 && res.valuenowSettled === '3', JSON.stringify(res));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
 await browser.close();
 console.log(failures ? '[fx] 失败 ' + failures + ' 项' : '[fx] 全部通过：粒子只横向流动，绽放拖到最高档才放一次，光标按图切换，触发器箭头不再闪，弹窗淡入淡出有残影兜底，只有 Max 变紫（含换模型复用节点）');
 process.exit(failures ? 1 : 0);

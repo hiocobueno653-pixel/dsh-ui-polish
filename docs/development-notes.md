@@ -545,6 +545,32 @@ CSS 里写 `translate: calc(11px + travel * t)`，
 ③ `measure()` 拖动中按连续位置（读 `--dshp-t`）重算 px，非拖动才用 preview。
 原地松手（没提交）按当前档续窗，保住"重开顶住默认档"的原始语义。
 
+踩坑 #20：手势"没提交就结束"的两条路径（pointercancel / lostpointercapture）
+
+#19 关窗之后补上的一个同类漏洞：`pointerdown` 把 3 秒窗口整扇关掉了，
+于是**任何没有提交就结束的手势**都必须重新续窗，否则下一轮扫描一看
+`settled`（`Date.now() >= pickedUntil` 成立）就拿还没落地的宿主 `aria-checked`
+回写位置 —— 真机上宿主往返要几百毫秒，滑杆先被拽回旧档、宿主再落地又被拽回来，
+还是同一种来回弹。
+
+覆盖到全部结束路径才干净：`pointerup` 跨档提交（`commit` 内续窗）、
+`pointerup` 原地松手（`endDrag` else 分支 `renewPickedWindow()`）、
+`pointercancel`（系统取消，以前只复位类名、忘了续窗 —— 这次补上，并顺带
+`geo = null` 作废这次手势的测量）。后两者合并成一个
+`endGestureWithoutCommit()`，并挂了 **`lostpointercapture`**：按下时我们
+`setPointerCapture` 了，宿主 React 中途把我们摘下时浏览器只发这一个事件 ——
+以前没接，`dragging` 和按压/抓握类名会永远留着（滑钮卡放大态、光标卡抓握、
+滑杆签名重装被类名护栏挡住、扫描轮一直误判"用户正拖着"）。它开头有
+`if (!dragging) return` 守卫：正常 pointerup 之后浏览器会补发一个迟到的
+lostpointercapture，守卫让它空转、不重复续窗（fx J-4 测的就是这一段）。
+各处统一走 `renewPickedWindow()`，窗口逻辑只有一份，不会再漏。
+
+测试 `fx J-3`：拖到 Max 提交后立刻再按住 0.6 处并派发 `pointercancel`，
+紧跟一轮 `enhanceMenu` 扫描，断言滑杆仍在 Max（`--dshp-t≈1`、`aria-valuenow=3`）
+且宿主落地后位置一致。修复前实测 `tAfterCancel=0.333、valuenow=1`（被拽回旧档）。
+`fx J-4` 走被抢走那条：拖起来后只派发 `lostpointercapture`，断言类名全部摘掉、
+滑杆回当前档，并且**迟到的第二个同类事件空转**（位置与读数不再动一下）。
+
 ## 踩坑 #18：换模型复用同一菜单节点 —— 滑杆闭包留在旧档位集
 
 宿主换模型时**不重建菜单 DOM**，React 只改行里的文字。我们那份"已接线"的滑杆于是
