@@ -32,9 +32,9 @@
     "node": ">=22.18.0"
   },
   "scripts": {
-    "test": "node test/freeze.browser.test.mjs && node test/glass.browser.test.mjs && node test/nav.browser.test.mjs && node test/selftest.browser.test.mjs && node test/slider.browser.test.mjs"
+    "test": "node test/freeze.browser.test.mjs && node test/glass.browser.test.mjs && node test/nav.browser.test.mjs && node test/selftest.browser.test.mjs && node test/slider.browser.test.mjs && node test/fx.browser.test.mjs"
   },
   "devDependencies": {
-    "playwright": "^1.55.0"
+    "playwright": "^1.63.0"
   }
 }

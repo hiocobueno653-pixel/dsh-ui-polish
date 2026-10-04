@@ -1,0 +1,446 @@
+/**
+ * 回归验证：填色特效（config: fx）。
+ *
+ * 守的四件事：
+ *   A. 流动粒子**只沿水平方向**：关键帧里没有任何纵向位移，终点贴着填色右端；
+ *   B. 绽放只在「拖进最高档」那一刻播**一次**（不是循环），且带着 MC 颜色状态；
+ *   C. 滑钮自己的动效不能碰 transform —— 位移仍归 CSS 过渡管，否则拖动会瞬移
+ *      （之前反复修过）；
+ *   D. 光标：平时箭头，按住/拖动变成抓握拳头。
+ */
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const { chromium } = require(process.env.DSHP_PLAYWRIGHT || 'playwright');
+
+const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+function grabFunction(name) {
+  const start = source.indexOf('function ' + name + '(');
+  if (start < 0) throw new Error('找不到 ' + name);
+  let depth = 0, i = source.indexOf('{', start);
+  for (; i < source.length; i++) {
+    if (source[i] === '{') depth++;
+    else if (source[i] === '}') { depth--; if (depth === 0) break; }
+  }
+  return source.slice(start, i + 1);
+}
+const defaultsSrc = (/var DEFAULTS = \{[\s\S]*?\};/.exec(source) || [''])[0];
+const buildCssFn = new Function(defaultsSrc + '\n' + grabFunction('readConfig') + '\n' +
+  grabFunction('buildCss') + '\nreturn buildCss;')();
+const readConfigFn = new Function(defaultsSrc + '\n' + grabFunction('readConfig') + '\nreturn readConfig;')();
+
+const CHROME = process.env.DSHP_CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
+const browser = await chromium.launch({ executablePath: CHROME });
+let failures = 0;
+const check = (name, ok, detail) => {
+  console.log((ok ? '  ok   ' : '  FAIL ') + name + (ok || detail === undefined ? '' : ' - ' + detail));
+  if (!ok) failures++;
+};
+
+const LEVELS = ['Off', 'Low', 'High', 'Max'];
+/* 桌面端同一个 _mods 字典会被连续 mount 复用，样式表是同一份；
+   夹具刻意不塞 <style>，避免 concerns 假阳性。 */
+/* ⚠️ 夹具不塞 <style>：样式必须来自插件 ensure() 注入的那一份，
+   否则 setFx 只更新了插件那份，夹具那份还在生效，测出假阳性（真机只有一份）。 */
+const SHELL = `<!doctype html><html><head><style>
+  :root{--dsw-alias-state-business-primary:#3b82f6;--dsw-alias-bg-layer-1:#fff;--dsw-alias-bg-layer-2:#ececf0;}
+  body{margin:24px;font:14px system-ui}
+  [role='menuitemradio']{display:flex;width:220px;padding:8px 10px;border:0;background:none;border-radius:8px;cursor:pointer;font:inherit;text-align:left}
+  </style></head><body>
+  <div data-slot="conversation.input.model"><button title="M · High"><span class="_triggerLabel_">M</span><span class="_triggerEffort_">High</span></button></div>
+  <div id="host"></div></body></html>`;
+
+async function mount(opts = {}) {
+  const ctx = await browser.newContext({ viewport: { width: 900, height: 700 },
+    reducedMotion: opts.reducedMotion });
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', e => errors.push(String(e).slice(0, 160)));
+  await page.setContent(SHELL);
+  await page.evaluate(src => {
+    window.__ModuleLoader__ = { _mods: {}, load(m) { this._mods[m.id] = m; } };
+    (0, eval)(src);
+  }, source);
+  await page.evaluate(cfg => {
+    window.__ModuleLoader__._mods['dsh-ui-polish'].factory().apply({ config: cfg });
+  }, Object.assign({ enabled: true, glass: true, slider: true }, opts.config || {}));
+  await page.evaluate(({ levels, current }) => {
+    const host = document.getElementById('host');
+    host.innerHTML = '<div role="menu">' + levels.map((l, i) =>
+      '<button type="button" role="menuitemradio" aria-checked="' + (i === current) +
+      '"><span class="optionCopy"><span class="modelName">' + l + '</span></span></button>').join('') + '</div>';
+    window.dshUiPolish.enhanceMenu(host.firstElementChild);
+  }, { levels: LEVELS, current: opts.current === undefined ? 1 : opts.current });
+  await page.waitForTimeout(600);
+  return { page, ctx, errors };
+}
+
+console.log('A. 流动粒子：只沿水平方向，贴在填色里');
+{
+  const { page, ctx, errors } = await mount({ current: 1 });
+  const info = await page.evaluate(() => {
+    const pclip = document.querySelector('.dshp-pclip');
+    const ps = Array.from(document.querySelectorAll('.dshp-p'));
+    const cs = ps.length ? getComputedStyle(ps[0]) : null;
+    /* keyframes 规则可能带供应商前缀（-webkit-），按前缀无关的方式找 dshpFlow */
+    let kf = null;
+    for (const st of Array.from(document.styleSheets)) {
+      let rules; try { rules = st.cssRules; } catch (e) { continue; }
+      for (const r of Array.from(rules || [])) {
+        if (!r || typeof r.name !== 'string') continue;
+        const nm = r.name.replace(/^-(webkit|moz|ms)-/i, '');
+        if (nm !== 'dshpFlow') continue;
+        kf = Array.from(r.cssRules || []).map(kr => {
+          const st2 = kr.style || {}; const props = [];
+          for (let i = 0; i < st2.length; i++) props.push(st2[i]);
+          return { key: kr.keyText, props, transform: st2.transform };
+        });
+      }
+    }
+    return {
+      count: ps.length,
+      overflow: pclip ? getComputedStyle(pclip).overflow : 'none',
+      topVarying: new Set(ps.map(p => getComputedStyle(p).top)).size,
+      fillW: pclip ? pclip.getBoundingClientRect().width : 0,
+      /* 轨道只有 20px 高，百分比换算成 px 会被四舍五入 —— 直接比较内联值更可靠 */
+      rawTops: Array.from(new Set(ps.map(p2 => p2.style.getPropertyValue('--y')))),
+      firstAnim: cs ? cs.animationName : null,
+      iterations: cs ? cs.animationIterationCount : null,
+      kf,
+    };
+  });
+  console.log('  ' + JSON.stringify({ count: info.count, overflow: info.overflow, topVarying: info.topVarying, iter: info.iterations }));
+  check('★ 填色里有多个流动小点', info.count >= 6, 'count=' + info.count);
+  check('★ 小点被裁剪在填色盒子里（overflow:hidden）', info.overflow === 'hidden', info.overflow);
+  check('★ 小点纵向位置铺开（不是排成一列）', info.rawTops.length >= 4, 'distinct --y=' + info.rawTops.length);
+  check('★ 关键帧只声明 transform 与 opacity（纯合成）',
+    !!info.kf && info.kf.every(k => k.props.every(p => p === 'transform' || p === 'opacity')),
+    JSON.stringify(info.kf && info.kf.map(k => k.props)));
+  /* 关键帧里每一步的 translate 第二分量必须为 0 —— 即完全没有纵向运动。
+     只看带位移的关键帧（0% 那步只有平地 git�় translate3d(0px,0px,0px)，同样合法）。 */
+  const ys = (info.kf || []).filter(k => k.transform).map(k => k.transform);
+  /* ⚠️ translate3d(X,Y,Z) 的 X 可能是 calc(var(...) * .2)，里面自带逗号 ——
+     必须先把嵌套的 calc()/var() 整体当成一段，再取第二个顶层分量来判断 Y。 */
+  const splitTop = (expr) => {
+    const inner = expr.slice(expr.indexOf('(') + 1, expr.lastIndexOf(')'));
+    const parts = []; let depth = 0, cur = '';
+    for (const ch of inner) {
+      if (ch === '(') depth++;
+      if (ch === ')') depth--;
+      if (ch === ',' && depth === 0) { parts.push(cur); cur = ''; continue; }
+      cur += ch;
+    }
+    parts.push(cur);
+    return parts.map(v => v.trim());
+  };
+  const hasY = ys.some(tr => {
+    const t3 = (tr || '').replace(/scale\([^)]*\)/g, '').trim();
+    if (!t3.startsWith('translate3d(')) return false;
+    const parts = splitTop(t3);
+    if (parts.length < 2) return false;
+    const yv = parts[1].replace(/px$/, '');
+    if (/^calc\(/.test(yv) || /var\(/.test(yv)) return true;   /* Y 里含计算式 = 有可能纵向动 */
+    return parseFloat(yv) !== 0;      /* Y 不为 0 = 会从上/下钻出来 */
+  });
+  check('★ 关键帧没有任何纵向位移（只左右走，不会从上下进出）', !hasY, JSON.stringify(ys));
+  check('★ 终点位移 = 恒定的 --dshp-trackW（不随拖动时的填色变化）',
+    ys.some(tr => tr && tr.includes('--dshp-trackW')) &&
+    !ys.some(tr => tr && tr.includes('--dshp-fillW')), JSON.stringify(ys));
+  const tip = await page.evaluate(() => {
+    const t = document.querySelector('.dshp-sliderTrack').getBoundingClientRect();
+    const f = document.querySelector('.dshp-sliderFill').getBoundingClientRect();
+    const k = document.querySelector('.dshp-sliderKnob').getBoundingClientRect();
+    return { fillRight: f.right, knobRight: k.right, trackRight: t.right };
+  });
+  check('★ 粒子可见范围（=填色）右端贴着滑钮、不越出轨道',
+    Math.abs(tip.fillRight - tip.knobRight) < 1.5 && tip.fillRight <= tip.trackRight + 0.6, JSON.stringify(tip));
+  /* 亮度层次：--o 分三档，才不会整条轨道九个点一样亮 */
+  const tone = await page.evaluate(() => {
+    const ps = Array.from(document.querySelectorAll('.dshp-p'));
+    const os = Array.from(new Set(ps.map(p => p.style.getPropertyValue('--o')))).sort();
+    return { os, count: ps.length };
+  });
+  console.log('  ' + JSON.stringify(tone));
+  check('★ 粒子有明暗层次（三档 --o，不是九个一样的白点）',
+    tone.os.length === 3 && tone.os.every(v => parseFloat(v) > 0 && parseFloat(v) <= 1), JSON.stringify(tone));
+  /* 淡入要到 20%、尾段留 15%：缺少任一段就会有"啪一下出现/消失"的观感 */
+  const curve = await page.evaluate(() => {
+    for (const st of Array.from(document.styleSheets)) {
+      let rules; try { rules = st.cssRules; } catch (e) { continue; }
+      for (const r of Array.from(rules || [])) {
+        if (!r || typeof r.name !== 'string') continue;
+        if (r.name.replace(/^-(webkit|moz|ms)-/i, '') !== 'dshpFlow') continue;
+        return Array.from(r.cssRules || []).map(kr => ({ key: kr.keyText, op: kr.style.opacity, tf: kr.style.transform }));
+      }
+    }
+    return null;
+  });
+  console.log('  ' + JSON.stringify(curve));
+  check('★ 淡入渐起（20% 处是中间亮度）且尾段留余光（100% 不为 0）',
+    !!curve && curve.some(k => k.key === '20%' && /calc\(.*\* *\.\d+\)/.test(k.op || '')) &&
+    curve.some(k => k.key === '100%' && /calc\(.*\* *\.\d+\)/.test(k.op || '')), JSON.stringify(curve));
+  check('★ 入场/出场改变大小（呼吸感），且每个有 transform 的帧结构一致',
+    !!curve && (() => {
+      const tf = curve.filter(k => k.tf).map(k => k.tf);
+      if (tf.length < 3) return false;
+      const scales = tf.map(t => {
+        const m = /scale\(([\d.]+)\)/.exec(t || '');
+        return m ? parseFloat(m[1]) : null;
+      });
+      const allTranslate3d = tf.every(t => /^translate3d\(/.test(t || ''));
+      const distinctScales = new Set(scales.filter(v => v !== null)).size;
+      return allTranslate3d && distinctScales >= 3;
+    })(), JSON.stringify(curve));
+  /* 粒子行程必须绑**恒定量**：绑 --dshp-fillW 会让粒子随拖动跟着跳（用户反馈）。 */
+  const anchor = await page.evaluate(() => {
+    const sl = document.querySelector('.dshp-slider');
+    return { trackW: sl.style.getPropertyValue('--dshp-trackW'),
+      kfEnd: (() => {
+        for (const st of Array.from(document.styleSheets)) {
+          let rules; try { rules = st.cssRules; } catch (e) { continue; }
+          for (const r of Array.from(rules || [])) {
+            if (!r || typeof r.name !== 'string') continue;
+            if (r.name.replace(/^-(webkit|moz|ms)-/i, '') !== 'dshpFlow') continue;
+            return Array.from(r.cssRules || [])
+              .map(kr => kr.style.transform)
+              .filter(Boolean).join(' | ');
+          }
+        }
+        return '';
+      })() };
+  });
+  console.log('  ' + JSON.stringify(anchor));
+  check('★ 位移绑恒定的 --dshp-trackW（不绑每帧变化的 --dshp-fillW）',
+    /--dshp-trackW/.test(anchor.kfEnd) && !/--dshp-fillW/.test(anchor.kfEnd) && !!anchor.trackW,
+    JSON.stringify(anchor));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
+console.log('B. 绽放：只在「拖进最高档」那一刻播一次');
+{
+  const { page, ctx, errors } = await mount({ current: 1 });
+  const rings = await page.evaluate(() => ({
+    n: document.querySelectorAll('.dshp-burst,.dshp-burst2').length,
+    hidden: Array.from(document.querySelectorAll('.dshp-burst')).every(b => +getComputedStyle(b).opacity === 0),
+  }));
+  check('★ 滑钮里挂着两层绽放环，平时完全不可见', rings.n === 2 && rings.hidden, JSON.stringify(rings));
+
+  /* 拖到最高档：数一下播放期间有多少个动画对象 */
+  const box = await page.$eval('.dshp-sliderTrack', el => { const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; });
+  await page.mouse.move(box.x + box.w * 0.2, box.y + box.h / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.w * 0.99, box.y + box.h / 2, { steps: 8 });
+  let seen = 0;
+  for (let i = 0; i < 6; i++) {
+    const n = await page.evaluate(() => document.getAnimations().filter(a => {
+      const t = a.effect && a.effect.target;
+      return t && /dshp-burst/.test(t.className || '');
+    }).length);
+    if (n > 0) seen = n;
+    await page.waitForTimeout(50);
+  }
+  await page.mouse.up();
+  await page.waitForTimeout(1200);   /* 等它播完 */
+  const after = await page.evaluate(() => ({
+    running: document.getAnimations().filter(a => {
+      const t = a.effect && a.effect.target;
+      return t && /dshp-burst/.test(t.className || '');
+    }).length,
+    hasMaxClass: document.querySelector('.dshp-slider').classList.contains('dshp-sliderMax'),
+    /* ⚠️ 这个夹具没有 React fiber，提交走的是 radio.click() 退路，
+       宿主的 aria-checked 不会自己变 —— 所以读滑杆自己的 aria 状态，
+       那才是插件负责的部分。 */
+    now: document.querySelector('.dshp-slider').getAttribute('aria-valuenow'),
+    text: document.querySelector('.dshp-slider').getAttribute('aria-valuetext'),
+  }));
+  console.log('  ' + JSON.stringify({ seen, after }));
+  check('★ 拖进最高档：两层环都播了一遍', seen === 2, 'seen=' + seen);
+  check('★ 播完就停，不再循环（running=0）', after.running === 0, JSON.stringify(after));
+  check('★ 停在最高档且滑杆读数是 Max', after.hasMaxClass && after.now === '3' && after.text === 'Max', JSON.stringify(after));
+
+  /* 已经在最高档时再拖：不应该再爆（没有「进入」这个动作） */
+  await page.mouse.move(box.x + box.w * 0.99, box.y + box.h / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.w * 0.99, box.y + box.h / 2, { steps: 3 });
+  let again = 0;
+  for (let i = 0; i < 6; i++) {
+    const n = await page.evaluate(() => document.getAnimations().filter(a => {
+      const t = a.effect && a.effect.target;
+      return t && /dshp-burst/.test(t.className || '');
+    }).length);
+    if (n > again) again = n;
+    await page.waitForTimeout(50);
+  }
+  await page.mouse.up();
+  await page.waitForTimeout(300);
+  check('★ 已经在最高档再拖：不会再放一次（只认「进入」那一瞬）', again === 0, 'again=' + again);
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
+console.log('C. 打开时本来就在最高档：不该开场就爆');
+{
+  const { page, ctx, errors } = await mount({ current: 3 });
+  const hasClass = await page.evaluate(() => document.querySelector('.dshp-slider').classList.contains('dshp-sliderMax'));
+  const ran = await page.evaluate(() => document.getAnimations().filter(a => {
+    const t = a.effect && a.effect.target;
+    return t && /dshp-burst/.test(t.className || '') && a.playState === 'running';
+  }).length);
+  check('★ 打开就是最高档：紫色状态照常给出', hasClass, 'class=' + hasClass);
+  check('★ 但没有自动绽放（避免每次开菜单都闪一下）', ran === 0, 'running=' + ran);
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
+console.log('D. 滑钮动效不碰 transform：位移仍归 CSS 过渡，拖动不瞬移');
+{
+  const { page, ctx, errors } = await mount({ current: 1 });
+  /* 键盘到最高档也会触发 fireBurst。动画只有 640ms，等跑完就查不到了 ——
+     必须在按键**之后立刻**取样。 */
+  const during = await page.evaluate(async () => {
+    const slider = document.querySelector('.dshp-slider');
+    slider.focus();
+    slider.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true, cancelable: true }));
+    await new Promise(r => requestAnimationFrame(r));
+    const k = document.querySelector('.dshp-sliderKnob');
+    /* ⚠️ 位移过渡是 CSS transition（CSSTransition 实例），它是**应该**存在的：
+       滑钮正是靠它平滑滑到最高档。要排除掉它，只看 fireBurst 用 WAAPI 发起的动画。 */
+    const onKnob = document.getAnimations()
+      .filter(a => a.effect && a.effect.target === k)
+      .filter(a => a.constructor && a.constructor.name !== 'CSSTransition');
+    const props = onKnob.map(a => Array.from(a.effect.getKeyframes())
+      .flatMap(f => Object.keys(f))
+      .filter(p => !['offset', 'computedOffset', 'easing', 'composite'].includes(p)));
+    return { n: onKnob.length, props: Array.from(new Set(props.flat())),
+      all: document.getAnimations().filter(a => a.effect && a.effect.target === k).length };
+  });
+  check('★ 滑钮上的动画只碰 box-shadow，不含 transform（不会劫持位移）',
+    during.n > 0 && during.props.length > 0 && during.props.every(p => p === 'boxShadow'), JSON.stringify(during));
+  /* 位移过渡没被阻断的最高证据：等落位动画跑完，滑钮真的贴到了轨道右端。 */
+  await page.waitForTimeout(700);
+  const pos = await page.evaluate(() => {
+    const t = document.querySelector('.dshp-sliderTrack').getBoundingClientRect();
+    const k = document.querySelector('.dshp-sliderKnob').getBoundingClientRect();
+    return { knobRight: k.right, trackRight: t.right,
+      x: document.querySelector('.dshp-slider').style.getPropertyValue('--dshp-x'),
+      travel: document.querySelector('.dshp-slider').style.getPropertyValue('--dshp-travel') };
+  });
+  check('★ 最高档时滑钮右缘贴到轨道右端', Math.abs(pos.knobRight - pos.trackRight) < 1.5, JSON.stringify(pos));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
+console.log('E. 光标：平时/按住箭头，按住+移动才变拳头');
+{
+  const { page, ctx, errors } = await mount({ current: 1 });
+  const idle = await page.$eval('.dshp-slider', el => getComputedStyle(el).cursor);
+  const box = await page.$eval('.dshp-sliderTrack', el => { const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; });
+  await page.mouse.move(box.x + box.w * 0.4, box.y + box.h / 2);
+  await page.mouse.down();
+  await page.waitForTimeout(60);
+  const pressed = await page.$eval('.dshp-slider', el => getComputedStyle(el).cursor);
+  await page.mouse.move(box.x + box.w * 0.6, box.y + box.h / 2, { steps: 3 });
+  const dragging = await page.$eval('.dshp-slider', el => getComputedStyle(el).cursor);
+  await page.mouse.up();
+  await page.waitForTimeout(60);
+  const back = await page.$eval('.dshp-slider', el => getComputedStyle(el).cursor);
+  console.log('  ' + JSON.stringify({ idle, pressed, dragging, back }));
+  check('★ 平时是普通箭头（图一）', idle === 'default', idle);
+  /* 用户要求：「按住并移动」两个条件同时成立才变拳头 —— 只按不动仍是箭头。 */
+  check('★ 只按住不动：还是普通箭头', pressed === 'default', pressed);
+  check('★ 拖动中保持拳头', dragging === 'grabbing', dragging);
+  check('★ 松手回到箭头', back === 'default', back);
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
+console.log('F. 关掉 fx：一行样式都不注入');
+{
+  const off = buildCssFn({ enabled: true, glass: true, tintAlpha: 0.76, blurPx: 40, slider: true, fx: false });
+  const on = buildCssFn({ enabled: true, glass: true, tintAlpha: 0.76, blurPx: 40, slider: true, fx: true });
+  const noSlider = buildCssFn({ enabled: true, glass: true, tintAlpha: 0.76, blurPx: 40, slider: false, fx: true });
+  /* 触发器箭头的抗闪烁规则属于滑杆段：slider 开着才注入，跟着 slider 开关走。 */
+  check('★ 常驻箭头规则随滑杆开关注入/撤掉',
+    /conversation\.input\.model'\] button::after/.test(on) &&
+    !/conversation\.input\.model'\] button::after/.test(noSlider), '');
+  check('★ 配置 fx:false 解析生效', readConfigFn({ config: { fx: false } }).fx === false, '');
+  check('★ 默认开着', readConfigFn({}).fx === true, '');
+  check('★ 关掉后样式表里没有粒子/绽放/渐变，开着时有',
+    !/dshp-p\{|dshp-burst|dshpFlow/.test(off) && /dshp-p\{|dshpFlow/.test(on), '');
+  check('★ 滑杆整段关掉时特效段也不注入', !/dshpFlow/.test(noSlider), '');
+
+  const { page, ctx, errors } = await mount({ current: 1, config: { fx: false } });
+  const dom = await page.evaluate(() => ({
+    particles: document.querySelectorAll('.dshp-p').length,
+    bursts: document.querySelectorAll('.dshp-burst,.dshp-burst2').length,
+  }));
+  check('★ fx:false 时一个粒子/绽放节点都不造', dom.particles === 0 && dom.bursts === 0, JSON.stringify(dom));
+
+  /* 运行时开关：只换样式表，不重建滑杆 DOM */
+  const rt = await page.evaluate(() => {
+    const knobBefore = document.querySelector('.dshp-sliderKnob');
+    const offState = window.dshUiPolish.setFx(false);
+    const offCount = document.querySelectorAll('.dshp-p').length;
+    const onState = window.dshUiPolish.setFx(true);
+    return { offState, onState, offCount, sameKnob: knobBefore === document.querySelector('.dshp-sliderKnob') };
+  });
+  check('★ setFx(false)/setFx(true) 返回正确且不重建 DOM',
+    rt.offState === false && rt.onState === true && rt.sameKnob, JSON.stringify(rt));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+
+  const rm = await mount({ current: 1, reducedMotion: 'reduce' });
+  const rmState = await rm.page.evaluate(() => {
+    const p = document.querySelector('.dshp-p');
+    const b = document.querySelector('.dshp-burst');
+    return { pAnim: p ? getComputedStyle(p).animationName : 'none',
+      bDisplay: b ? getComputedStyle(b).display : 'none' };
+  });
+  check('★ prefers-reduced-motion：粒子停下、绽放撤掉',
+    rmState.pAnim === 'none' && rmState.bDisplay === 'none', JSON.stringify(rmState));
+  await rm.page.close(); await rm.ctx.close();
+}
+
+console.log('G. 触发器常驻箭头：宿主可替换图标全隐藏，箭头由 ::after 绘制');
+{
+  const { page, ctx, errors } = await mount({ current: 1 });
+  const g = await page.evaluate(async () => {
+    const btn = document.querySelector("[data-slot='conversation.input.model'] button");
+    /* 模拟宿主两态：空闲时箭头 svg、提交档位时换成 StateDot 转圈 svg。
+       两者都必须被藏掉 —— 否则卸载/重挂那一下就是用户反馈的「小箭头会闪」。 */
+    const ns = 'http://www.w3.org/2000/svg';
+    const chev = document.createElementNS(ns, 'svg');
+    chev.setAttribute('class', 'wq12jW_chevron');
+    const dot = document.createElementNS(ns, 'svg');
+    dot.setAttribute('data-state', 'ongoing');
+    btn.appendChild(chev); btn.appendChild(dot);
+    const after = getComputedStyle(btn, '::after');
+    const closedTransform = after.transform;
+    btn.setAttribute('aria-expanded', 'true');
+    await new Promise(r => setTimeout(r, 200));  /* 等 120ms 过渡跑完再读 */
+    const openTransform = getComputedStyle(btn, '::after').transform;
+    btn.disabled = true;
+    const disabledOpacity = getComputedStyle(btn, '::after').opacity;
+    return {
+      chevHidden: getComputedStyle(chev).display === 'none',
+      dotHidden: getComputedStyle(dot).display === 'none',
+      arrowDrawn: after.width === '7px' && after.position === 'absolute' &&
+        after.borderRightWidth === '1px',
+      /* 常驻箭头仍跟随开合状态换朝向（观感与宿主原生一致）。 */
+      rotates: closedTransform !== openTransform &&
+        /matrix/.test(closedTransform) && /matrix/.test(openTransform),
+      disabledFade: parseFloat(disabledOpacity) < 1,
+    };
+  });
+  check('★ 箭头 svg 与转圈 svg 都被隐藏（闪烁根源消掉）', g.chevHidden && g.dotHidden, JSON.stringify(g));
+  check('★ 常驻箭头由 ::after 画出来', g.arrowDrawn, JSON.stringify(g));
+  check('★ 开合朝向跟随 aria-expanded', g.rotates, JSON.stringify(g));
+  check('★ 按钮禁用时箭头跟着变淡', g.disabledFade, JSON.stringify(g));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
+await browser.close();
+console.log(failures ? '[fx] 失败 ' + failures + ' 项' : '[fx] 全部通过：粒子只横向流动，绽放拖到最高档才放一次，光标按图切换，触发器箭头不再闪');
+process.exit(failures ? 1 : 0);
