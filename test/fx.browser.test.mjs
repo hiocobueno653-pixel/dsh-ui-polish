@@ -996,6 +996,95 @@ console.log('J-4. 指针中途被宿主抢走（lostpointercapture）：手势�
   await page.close(); await ctx.close();
 }
 
+console.log('L. 填色材质：边光与颗粒的像素厚度恒定、颗粒不漏到未填的轨道上');
+{
+  /* 这一组守的是「填充物的质感」：
+     - 填色条被 scaleX(sx) 横向拉过，写死的 1px 边光会被一起拉粗，
+       所以 .dshp-sliderBevel / .dshp-sliderMesh 用 1/sx 反缩放。
+       守：视觉盒子始终等于填色条（≤1.5px 误差），否则就是反缩放写错了。
+     - 反缩放后布局宽 = 轨道宽/sx，比填色条宽得多；填色必须 overflow:hidden，
+       否则颗粒会漏到右边那段还没填的轨道上（实测能看到灰底上的白点）。
+     - Max 的紫渐变必须早于末端到满：填色右缘恒等于滑钮圆心，末端 11px 永远被盖住。 */
+  const { page, ctx, errors } = await mount({ current: 1 });
+  const geo = await page.evaluate(async () => {
+    const out = [];
+    const s = document.querySelector('.dshp-slider');
+    const track = s.querySelector('.dshp-sliderTrack');
+    const fill = s.querySelector('.dshp-sliderFill');
+    const bevel = s.querySelector('.dshp-sliderBevel');
+    const mesh = s.querySelector('.dshp-sliderMesh');
+    const fillRect = fill.getBoundingClientRect();
+    const tr = track.getBoundingClientRect();
+    /* ⚠️ 不能直接拿 bevel/mesh 的 getBoundingClientRect 比：它们是反缩放过的，
+          boundingClientRect 给的是**未被裁剪**的布局盒（比填色宽得多）。
+          真正决定"看得见哪一段"的是填色的 overflow:hidden 裁剪盒，所以这里
+          ①读它们的实际反缩放系数，②读填色的裁剪几何 —— 两者合起来才是可见范围。 */
+    const read = () => {
+      const fr = fill.getBoundingClientRect();
+      const br = bevel.getBoundingClientRect();
+      const mr = mesh.getBoundingClientRect();
+      /* 可见右缘 = min(材质层右缘, 填色右缘)；材质层被 1/sx 放大到远超填色时，
+         可见部分完全由填色决定（这正是 overflow:hidden 的作用）。 */
+      return {
+        fillW: fr.width, fillR: fr.right,
+        bevelVisibleR: Math.min(br.right, fr.right), bevelVisibleW: Math.min(br.right, fr.right) - fr.left,
+        meshVisibleR: Math.min(mr.right, fr.right),
+        meshCoversFill: mr.right >= fr.right - 0.5,   /* 材质层要盖满填色，不能半路断 */
+        sx: +s.style.getPropertyValue('--dshp-sx'),
+        bevelSx: /matrix\(([^,]+),/.test(getComputedStyle(bevel).transform) ? +RegExp.$1 : 1,
+      };
+    };
+    /* 三个宽度：低（sx≈0）/ 中 / 满 —— 反缩放算错时，窄填色下误差最明显。
+       用指针拖到精确位置（键盘 End/Home 会连带触发提交与扫描，位置不好控）。 */
+    const kw = s.querySelector('.dshp-sliderKnob').offsetWidth || 22;
+    const travel = tr.width - kw;
+    const y = tr.top + tr.height / 2;
+    const pev = (type, t) => new PointerEvent(type, Object.assign(
+      { bubbles: true, cancelable: true, button: 0, pointerId: 1, isPrimary: true },
+      { clientX: tr.left + kw / 2 + travel * t, clientY: y }));
+    for (const t of [0, 0.5, 1]) {
+      track.dispatchEvent(pev('pointerdown', t));
+      track.dispatchEvent(pev('pointermove', t));
+      track.dispatchEvent(pev('pointerup', t));
+      await new Promise(r => setTimeout(r, 750));
+      out.push(read());
+    }
+    const csMesh = getComputedStyle(mesh);
+    return { out, fillOverflow: getComputedStyle(fill).overflow,
+             meshAnim: csMesh.animationName, meshMask: (csMesh.maskImage || '').slice(0, 8),
+             trackR: tr.right };
+  });
+  for (const g of geo.out) {
+    /* 反缩放系数要等于 1/sx（夹了下限 .02）：这条是材质的像素厚度恒定的根。 */
+    const want = 1 / Math.max(g.sx, 0.02);
+    check('★ 边光/颗粒按 1/sx 反缩放（sx=' + g.sx.toFixed(2) + '）',
+      Math.abs(g.bevelSx - want) < 0.02, JSON.stringify({ bevelSx: g.bevelSx, want }));
+    check('★ 材质层盖满整条填色、不越出轨道（sx=' + g.sx.toFixed(2) + '）',
+      g.meshCoversFill && g.bevelVisibleR <= geo.trackR + 0.6, JSON.stringify(g));
+  }
+  check('★ 填色裁剪掉反缩放溢出的部分（overflow:hidden）', geo.fillOverflow === 'hidden', geo.fillOverflow);
+  check('★ 颗粒是横向流动的材质动画（不是静态贴图）', geo.meshAnim === 'dshpMesh', geo.meshAnim);
+  check('★ 颗粒带受光方向的纵向蒙版', geo.meshMask === 'linear-g', geo.meshMask);
+
+  /* Max 紫渐变：颜色必须在滑钮左侧就到位。取填色条 70% 处的像素，
+     它离右端还有 ~30% 的余量（远在滑钮左边），必须是明显偏紫而不是主题蓝。 */
+  const atMax = await page.evaluate(async () => {
+    const s = document.querySelector('.dshp-slider');
+    s.focus();
+    s.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true, cancelable: true }));
+    await new Promise(r => setTimeout(r, 800));
+    const fill = s.querySelector('.dshp-sliderFill');
+    const grad = getComputedStyle(fill, '::before');
+    const kn = s.querySelector('.dshp-sliderKnob').getBoundingClientRect();
+    return { opacity: grad.opacity, knobLeft: kn.left,
+             stops: (grad.backgroundImage.match(/rgba?\([^)]*\)/g) || []).length };
+  });
+  check('★ Max 时紫渐变层完全显形（10 段色阶都在，不是退化成一整块）',
+    atMax.opacity === '1' && atMax.stops >= 8, JSON.stringify(atMax));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
 await browser.close();
-console.log(failures ? '[fx] 失败 ' + failures + ' 项' : '[fx] 全部通过：粒子只横向流动，绽放拖到最高档才放一次，光标按图切换，触发器箭头不再闪，弹窗淡入淡出有残影兜底，只有 Max 变紫（含换模型复用节点）');
+console.log(failures ? '[fx] 失败 ' + failures + ' 项' : '[fx] 全部通过：粒子只横向流动，绽放拖到最高档才放一次，光标按图切换，触发器箭头不再闪，弹窗淡入淡出有残影兜底，只有 Max 变紫（含换模型复用节点），填色材质的反缩放与裁剪正确');
 process.exit(failures ? 1 : 0);
