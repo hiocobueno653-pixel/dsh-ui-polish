@@ -1085,6 +1085,93 @@ console.log('L. 填色材质：边光与颗粒的像素厚度恒定、颗粒不�
   await page.close(); await ctx.close();
 }
 
+console.log('M. 滑钮的立体感在各状态下都在（box-shadow 是整条替换，最容易被状态规则吃掉）');
+{
+  /* 这一组守的是一条静默回归：box-shadow **不叠加**，后写的规则整条替换前一条。
+     早先 Max 档的紫晕与按住/拖动两态各自整条重写 box-shadow，把滑钮的
+     inset 顶部高光吃掉了 —— 滑到 Max 时滑钮从"有立体感的球"变成"一张纯白圆片"，
+     肉眼不容易当场发现（白圆片在浅色主题下也说得过去）。
+     现在内高光由基础规则提供，状态规则只换 --dshp-knobShadow（外部那两段）。 */
+  const { page, ctx, errors } = await mount({ current: 1 });
+  const read = () => page.evaluate(() => {
+    const s = document.querySelector('.dshp-slider');
+    const k = s.querySelector('.dshp-sliderKnob');
+    const cs = getComputedStyle(k);
+    const layers = cs.boxShadow === 'none' ? [] : cs.boxShadow.split(/,(?![^(]*\))/).map(v => v.trim());
+    return {
+      max: s.classList.contains('dshp-sliderMax'),
+      pressed: s.classList.contains('dshp-sliderPressed'),
+      active: s.classList.contains('dshp-sliderActive'),
+      inset: layers.filter(v => v.includes('inset')).length,
+      outer: layers.filter(v => !v.includes('inset')).length,
+      knobVar: cs.getPropertyValue('--dshp-knobShadow').trim().slice(0, 12),
+    };
+  });
+  const idle = await read();
+  check('★ 平时：内高光 1 段 + 外部阴影 2 段（接触阴影 + 抬起阴影）',
+    idle.inset === 1 && idle.outer === 2, JSON.stringify(idle));
+  /* 刻点：亮起的点是**实心**的，不能是同心圆环（5px 的点加 1px 内阴影就会变成环）。
+     ⚠️ 必须在动滑杆**之前**读：夹具当前档是 Low，此时正好既有亮着的点也有暗着的点；
+        后面把滑杆推到 Max 之后，所有刻点都亮着，:not(.On) 选不到东西。 */
+  const dots = await page.evaluate(() => {
+    const on = document.querySelector('.dshp-sliderDotOn');
+    const off = document.querySelector('.dshp-sliderDot:not(.dshp-sliderDotOn)');
+    return { onShadow: on ? getComputedStyle(on).boxShadow : 'none',
+             onBg: on ? getComputedStyle(on).backgroundColor : '',
+             offBg: off ? getComputedStyle(off).backgroundColor : '',
+             counts: { on: document.querySelectorAll('.dshp-sliderDotOn').length,
+                       off: document.querySelectorAll('.dshp-sliderDot:not(.dshp-sliderDotOn)').length } };
+  });
+  check('★ 前提成立：夹具里既有亮着的刻点也有暗着的（否则下面的比较没意义）',
+    dots.counts.on > 0 && dots.counts.off > 0, JSON.stringify(dots.counts));
+  check('★ 亮起的刻点不带 inset 阴影（否则 5px 的圆点会变成圆环）',
+    !/inset/.test(dots.onShadow), dots.onShadow);
+  check('★ 亮/暗刻点是两档实心色，不是一个色只改透明度',
+    dots.onBg !== dots.offBg, JSON.stringify({ on: dots.onBg, off: dots.offBg }));
+  /* 按住（还没动）—— _fill-shot / slider 夹具用的是真的 pointerdown。 */
+  const pressed = await page.evaluate(async () => {
+    const s = document.querySelector('.dshp-slider');
+    const track = s.querySelector('.dshp-sliderTrack');
+    const r = track.getBoundingClientRect();
+    track.dispatchEvent(new PointerEvent('pointerdown', {
+      bubbles: true, cancelable: true, button: 0, pointerId: 1, isPrimary: true,
+      clientX: r.left + r.width * 0.45, clientY: r.top + r.height / 2 }));
+    await new Promise(x => setTimeout(x, 120));
+    const k = s.querySelector('.dshp-sliderKnob');
+    const cs = getComputedStyle(k);
+    const layers = cs.boxShadow === 'none' ? [] : cs.boxShadow.split(/,(?![^(]*\))/).map(v => v.trim());
+    return { inset: layers.filter(v => v.includes('inset')).length,
+             outer: layers.filter(v => !v.includes('inset')).length,
+             pressed: s.classList.contains('dshp-sliderPressed') };
+  });
+  check('★ 按住态：内高光仍在（状态只换外部阴影）',
+    pressed.pressed === true && pressed.inset === 1 && pressed.outer === 2, JSON.stringify(pressed));
+  const atMax = await page.evaluate(async () => {
+    const s = document.querySelector('.dshp-slider');
+    s.focus();
+    s.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true, cancelable: true }));
+    await new Promise(x => setTimeout(x, 900));
+    const k = s.querySelector('.dshp-sliderKnob');
+    const cs = getComputedStyle(k);
+    const layers = cs.boxShadow === 'none' ? [] : cs.boxShadow.split(/,(?![^(]*\))/).map(v => v.trim());
+    const knobVar = cs.getPropertyValue('--dshp-knobShadow');
+    return { max: s.classList.contains('dshp-sliderMax'),
+             inset: layers.filter(v => v.includes('inset')).length,
+             outer: layers.filter(v => !v.includes('inset')).length,
+             /* ⚠️ 自定义属性上的 color-mix 不会被求值，读出来仍是原文
+                （color-mix(in srgb,#8b5cf6 55%,transparent)）；
+                哪天换成写字面量，Chrome 又会序列化成 color(srgb .545 .361 .965)。
+                两个形态都认，免得这条断言因为"换了颜色写法"而假失败。 */
+             hasGlow: /#8b5cf6/i.test(knobVar) || /139, 92, 246/.test(knobVar) || /0\.545\d* 0\.36\d* 0\.96\d*/.test(knobVar),
+             knobVar: knobVar.trim().slice(0, 40) };
+  });
+  check('★ Max 档：内高光仍在，且外部多一道紫晕',
+    atMax.max === true && atMax.inset === 1 && atMax.outer === 3 && atMax.hasGlow, JSON.stringify(atMax));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
 await browser.close();
-console.log(failures ? '[fx] 失败 ' + failures + ' 项' : '[fx] 全部通过：粒子只横向流动，绽放拖到最高档才放一次，光标按图切换，触发器箭头不再闪，弹窗淡入淡出有残影兜底，只有 Max 变紫（含换模型复用节点），填色材质的反缩放与裁剪正确');
+console.log(failures ? '[fx] 失败 ' + failures + ' 项' : '[fx] 全部通过：粒子只横向流动，绽放拖到最高档才放一次，光标按图切换，触发器箭头不再闪，弹窗淡入淡出有残影兜底，只有 Max 变紫（含换模型复用节点），填色材质反缩放与裁剪正确，滑钮立体感各状态都在');
 process.exit(failures ? 1 : 0);
+

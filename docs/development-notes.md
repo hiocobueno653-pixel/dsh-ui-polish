@@ -621,3 +621,28 @@ lostpointercapture，守卫让它空转、不重复续窗（fx J-4 测的就是�
 材质层盖满填色且不越出轨道；Max 时验 10 段色阶都在（不是退化成一整块）。
 **注意别用 `getBoundingClientRect()` 直接比材质层与填色的宽度** —— 它给的是
 未被裁剪的布局盒，比填色宽得多，看起来像"漏出去了"，其实是 `overflow:hidden` 正常工作。
+
+## 踩坑 #20：`box-shadow` 是整条替换，状态规则会静默吃掉立体感
+
+滑钮的立体感靠一条 `box-shadow` 里的三段：`inset` 顶部高光 + 接触阴影 + 抬起阴影。
+`box-shadow` **不叠加**，后写的规则整条换掉前一条 —— 于是：
+
+- `.dshp-sliderMax .dshp-sliderKnob` 为了加紫晕整条重写了阴影，把内高光吃掉了；
+- `.dshp-sliderPressed/.dshp-sliderActive` 同理。
+
+结果是**滑到 Max 时滑钮从"有立体感的球"变成"一张纯白圆片"**。这种回归很难当场发现：
+浅色主题下白圆片看着也说得过去，只有和别的状态对照才看得出。
+
+**修法**：外部阴影抽成变量 `--dshp-knobShadow`，状态规则只改这个变量，
+内高光由基础规则的 `box-shadow:inset …, var(--dshp-knobShadow)` 统一提供。
+加一条"内高光永远存在"的回归（`test/fx.browser.test.mjs` M 组，三个状态各验一次）。
+
+同一组里还留了两条当时的判断：
+
+- **刻点不能加 `inset` 阴影**：刻点只有 5px，1px 内阴影会把中心留成 3px 的洞，
+  3 倍放大下亮起的点是一枚**同心圆环**而不是实心点。对比度交给 `background`
+  的两档颜色（`accent 38%` / `white 62%`），形状交给 `transform`。
+- 写断言时别拿 `document.querySelector('.dshp-sliderDot')` 当"暗点"：
+  它是第一个点，当前档在 Low 时它正好是**亮着**的（`dots.on === dots.off` 的
+  假失败就是这么来的）。用 `:not(.dshp-sliderDotOn)` 选，并且要在推滑杆**之前**读 ——
+  推到 Max 之后所有点都亮着。
