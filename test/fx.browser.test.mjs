@@ -1171,7 +1171,96 @@ console.log('M. 滑钮的立体感在各状态下都在（box-shadow 是整条�
   await page.close(); await ctx.close();
 }
 
+console.log('N. 凹槽跟着主题走：深色下不能用浅色那套强度（否则轨道是一块平灰板）');
+{
+  /* 轨道底色 = 「文字色 13%」，深浅主题自动反相 —— 所以轨道在深色下是深灰。
+     写死的 rgba(0,0,0,.07) 压在深灰上几乎没差别，「凹槽」根本没画出来。
+     宿主在 :root 上设 color-scheme（light/dark），所以用 light-dark() 取两套强度。
+     ⚠️ 自定义属性上的 light-dark() 不会被求值（读出来是原文），
+        必须读**已解析**的 track box-shadow。 */
+  const { page, ctx, errors } = await mount({ current: 1 });
+  const readAt = (scheme) => page.evaluate(async (scheme) => {
+    document.documentElement.style.colorScheme = scheme;
+    await new Promise(r => setTimeout(r, 120));
+    const t = document.querySelector('.dshp-sliderTrack');
+    const shadows = getComputedStyle(t).boxShadow;
+    /* 按顶层逗号切成段（rgba()/color() 内部的逗号不能算分隔符），只留 inset 段。
+       ⚠️ Chrome 会把带 alpha 的 color-mix 序列化成 color(srgb r g b / a)，
+          不是 rgba() —— 两种形态都要能取到 alpha。 */
+    const alphaOf = (s) => {
+      let m = /rgba?\([^)]*,\s*([\d.]+)\s*\)/.exec(s);
+      if (m) return parseFloat(m[1]);
+      m = /color\(srgb[^/]*\/\s*([\d.]+)\s*\)/.exec(s);
+      if (m) return parseFloat(m[1]);
+      return 1;
+    };
+    const insets = shadows.split(/,(?![^(]*\))/).map(s => s.trim())
+      .filter(s => s.includes('inset')).map(alphaOf);
+    return { scheme: getComputedStyle(document.documentElement).colorScheme, insets, shadows };
+  }, scheme);
+  const light = await readAt('light');
+  const dark = await readAt('dark');
+  check('★ 两种 color-scheme 都读到了（前提成立）',
+    light.scheme === 'light' && dark.scheme === 'dark', JSON.stringify({ l: light.scheme, d: dark.scheme }));
+  check('★ 轨道确实有凹槽的 inset 阴影（不是平色板）', light.insets.length >= 2 && dark.insets.length >= 2,
+    JSON.stringify({ l: light.insets, d: dark.insets }));
+  /* 上沿那道是在 down 方向偏移的那一段：取两套里"非口沿"的较大 alpha 比较 */
+  const topOf = (v) => Math.max.apply(null, v.insets.slice(1));
+  check('★ 深色的凹槽比浅色明显更深（不是同一套写死的强度）',
+    topOf(dark) > topOf(light) * 2, JSON.stringify({ light: topOf(light), dark: topOf(dark) }));
+  check('★ 浅色仍克制（没有把浅色主题弄脏）', topOf(light) <= 0.12, String(topOf(light)));
+  check('无页面报错', errors.length === 0, errors.join('|'));
+  await page.close(); await ctx.close();
+}
+
+console.log('O. config.fx:false 只关「动」的那部分，不关材质（填色不该退回一张平色纸）');
+{
+  /* fx 这条配置项的语义一直是"特效"（粒子/绽放/Max 渐变），但填充材质
+     （边光 .dshp-sliderBevel、竖向光泽 ::after）是**静态**的，跟动效无关。
+     这里把它钉住：fx:false 时材质仍在、网格与粒子不在；fx:true 时全都在。
+     ⚠️ 上一次我在交付说明里把这条说反了（说 fx:false 会连材质一起关），
+        用一组断言把它变成可验证的事实，而不是靠记忆。 */
+  const withFx = await mount({ current: 1, config: { fx: true } });
+  const on = await withFx.page.evaluate(() => {
+    const fill = document.querySelector('.dshp-sliderFill');
+    const bevel = document.querySelector('.dshp-sliderBevel');
+    return {
+      bevel: !!bevel,
+      bevelShadow: bevel ? getComputedStyle(bevel).boxShadow : 'none',
+      gloss: fill ? getComputedStyle(fill, '::after').opacity : '-',
+      mesh: !!document.querySelector('.dshp-sliderMesh'),
+      particles: document.querySelectorAll('.dshp-p').length,
+    };
+  });
+  await withFx.page.close(); await withFx.ctx.close();
+  check('★ fx:true：材质 + 颗粒 + 粒子全在',
+    on.bevel && /inset/.test(on.bevelShadow) && on.mesh && on.particles >= 6,
+    JSON.stringify({ ...on, bevelShadow: undefined }));
+
+  const noFx = await mount({ current: 1, config: { fx: false } });
+  const off = await noFx.page.evaluate(() => {
+    const fill = document.querySelector('.dshp-sliderFill');
+    const bevel = document.querySelector('.dshp-sliderBevel');
+    return {
+      slider: !!document.querySelector('.dshp-slider'),
+      bevel: !!bevel,
+      bevelShadow: bevel ? getComputedStyle(bevel).boxShadow : 'none',
+      gloss: fill ? getComputedStyle(fill, '::after').opacity : '-',
+      mesh: !!document.querySelector('.dshp-sliderMesh'),
+      particles: document.querySelectorAll('.dshp-p').length,
+    };
+  });
+  check('★ fx:false：滑杆照常装上', off.slider === true, JSON.stringify(off));
+  check('★ fx:false：边光材质仍在（不是一张平色纸）',
+    off.bevel === true && /inset/.test(off.bevelShadow), JSON.stringify({ bevel: off.bevel, shadow: off.bevelShadow }));
+  check('★ fx:false：竖向光泽仍在', off.gloss === '1', off.gloss);
+  check('★ fx:false：网格与粒子都撤掉（这才是"关特效"）',
+    off.mesh === false && off.particles === 0, JSON.stringify({ mesh: off.mesh, particles: off.particles }));
+  check('无页面报错', noFx.errors.length === 0, noFx.errors.join('|'));
+  await noFx.page.close(); await noFx.ctx.close();
+}
+
 await browser.close();
-console.log(failures ? '[fx] 失败 ' + failures + ' 项' : '[fx] 全部通过：粒子只横向流动，绽放拖到最高档才放一次，光标按图切换，触发器箭头不再闪，弹窗淡入淡出有残影兜底，只有 Max 变紫（含换模型复用节点），填色材质反缩放与裁剪正确，滑钮立体感各状态都在');
+console.log(failures ? '[fx] 失败 ' + failures + ' 项' : '[fx] 全部通过：粒子只横向流动，绽放拖到最高档才放一次，光标按图切换，触发器箭头不再闪，弹窗淡入淡出有残影兜底，只有 Max 变紫（含换模型复用节点），填色材质反缩放与裁剪正确，滑钮立体感各状态都在，凹槽跟着 color-scheme 走，fx:false 只关动效不关材质');
 process.exit(failures ? 1 : 0);
 

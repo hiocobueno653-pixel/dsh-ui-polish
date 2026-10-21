@@ -646,3 +646,78 @@ lostpointercapture，守卫让它空转、不重复续窗（fx J-4 测的就是�
   它是第一个点，当前档在 Low 时它正好是**亮着**的（`dots.on === dots.off` 的
   假失败就是这么来的）。用 `:not(.dshp-sliderDotOn)` 选，并且要在推滑杆**之前**读 ——
   推到 Max 之后所有点都亮着。
+
+## 踩坑 #21：深色主题下"凹槽"是画在空气里的
+
+轨道的凹槽靠两道 `inset` 内阴影（上沿一道黑、下沿一道白）。两道都写死了强度：
+
+```css
+inset 0 1px 2px rgba(0,0,0,.07), inset 0 -1px 1px rgba(255,255,255,.08)
+```
+
+浅色主题里轨道是浅灰，7% 的黑压上去刚好；**深色主题里轨道本身已经是深灰**
+（底色是 `label-primary 13%`，深色下 label-primary 是浅色 → 轨道是深灰），
+7% 的黑在深灰上几乎是零差别 —— 深色下轨道就是一块平灰板，凹槽没画出来。
+
+**修法**：宿主在 `:root` 上设 `color-scheme`（`dsh-client-ui-theme` 的
+"Project a snapshot onto the document: set root color-scheme"），所以直接用
+`light-dark()` 取两套强度：
+
+```css
+--dshp-grooveTop:rgba(0,0,0,.07);                                   /* 兜底 */
+--dshp-grooveTop:light-dark(rgba(0,0,0,.07), rgba(0,0,0,.5));       /* 生效 */
+--dshp-grooveBottom:rgba(255,255,255,.08);
+--dshp-grooveBottom:light-dark(rgba(255,255,255,.08), rgba(255,255,255,.2));
+```
+
+每个变量写两遍是有意的：不认 `light-dark()` 的浏览器把第二行当无效声明丢掉，
+第一行的浅色版本自动生效，不需要 `@supports`。
+
+两条测试坑：
+
+- **自定义属性上的 `light-dark()` 不会被求值**：读 `--dshp-grooveTop` 拿到的是
+  原文 `light-dark(rgba(0,0,0,.07),rgba(0,0,0,.5))`。要验效果必须读**已解析**的
+  `getComputedStyle(track).boxShadow`。
+- 解析 `box-shadow` 时，Chrome 对带 alpha 的 `color-mix` 会序列化成
+  `color(srgb r g b / a)` 而不是 `rgba()`，只按 `rgba?\(` 匹配会漏段
+  （实测只取到 1 段，另两段是 `color(...)`）。按顶层逗号切段 + 两种形态都取 alpha。
+
+回归在 `test/fx.browser.test.mjs` 的 N 组：切 `color-scheme` 两遍，验深色的凹槽
+明显更深（>2 倍）且浅色仍克制（≤0.12）。
+
+## 配置语义：`fx:false` 只关「动」，不关材质
+
+填充材质里有两类东西，一直混在一起说，容易讲错：
+
+| 类别 | 具体 | `fx:false` 时 |
+| --- | --- | --- |
+| 静态材质 | 边光 `.dshp-sliderBevel`、竖向光泽 `::after` | **保留** |
+| 动效 | 流动颗粒 `.dshp-sliderMesh`、粒子 `.dshp-p`、绽放、Max 紫渐变 | 撤掉 |
+
+CSS 侧的真相是：材质规则写在 `sliderCss`（跟着 `slider` 开关），动效规则写在
+`fxCss`（跟着 `slider && fx`）。DOM 侧 `bevel` 无条件创建、`mesh` 只在
+`fx !== false` 时创建 —— 两者是**独立**的，所以"关掉特效"不会把填色退回平色纸。
+
+O 组把这四件事各验一条，避免以后再靠记忆描述这个开关。
+
+## DSH 升级到 0.2.1-rc.2 后的契约核对
+
+宿主把模型选单拆成了独立包 `@deepseek-ai/dsh-client-ui-model-selection`，
+但要靠的几处都没变（2026-10 核对）：
+
+- slot 仍是 `conversation.input.model`；
+- 档位页仍是 `role="menuitemradio"` + `aria-checked`，行内仍是
+  `optionCopy > modelName`（`hasModelSelectMarkup` 的判据成立）；
+- `pane` 状态取值仍是 `"root" | "model" | "effort"`（`paneOf` 扫描
+  `memoizedState` 找这三个字符串的做法仍有效）；
+- 模型页容器 `role="group"`、档位页容器 `role="menu"`（`looksLikeModelList`
+  靠 `closest('[role=group]')` 判列表页，成立）；
+- 新增搜索框（`role="searchbox"`），判据里已经覆盖；
+- `data-menu-material` 仍在（毛玻璃那半没受影响）；
+- 触发器仍自带 `IconChevronDownOutlineRegular`（类名含 `chevron`），插件
+  「隐藏宿主箭头、自绘伪元素」的规则仍匹配；`triggerIcon` 排除项仍有效。
+
+真机验证做不了：桌面端 UI 走 Electron 自定义 scheme（`--standard-schemes=dsh-app`），
+`http://127.0.0.1:<port>` 直接请求返回 401；内置浏览器 provider 也起不来
+（没有可 spawn 的 Electron 二进制）。所以结论只能靠"读宿主源码核对契约 +
+Playwright 夹具"两层，交付时要如实说明这一点。
