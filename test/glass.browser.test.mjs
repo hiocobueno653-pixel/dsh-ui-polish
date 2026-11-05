@@ -158,7 +158,7 @@ console.log('配置真的生效');
      否则 glass:false + slider:true 会装出没有样式的裸滑杆（真机 bug）。 */
   const onlySlider = factory('return buildCss(readConfig({ config: { glass: false, slider: true } }));')();
   check('★ 只开滑杆：不含毛玻璃材质规则', !onlySlider.includes("data-menu-material='translucent']{"), '');
-  check('★ 只开滑杆：仍含滑杆规则', onlySlider.includes('.dshp-sliderTrack{') && onlySlider.includes('.dshp-levelPage >'), '');
+  check('★ 只开滑杆：仍含滑杆规则', onlySlider.includes('.dshp-sliderTrack{') && onlySlider.includes(".dshp-levelPage [role='menuitemradio']"), '');
   const onlyGlass = factory('return buildCss(readConfig({ config: { glass: true, slider: false } }));')();
   check('★ 只开毛玻璃：含材质规则、不含滑杆规则',
     onlyGlass.includes("data-menu-material='translucent']{") && !onlyGlass.includes('.dshp-sliderTrack{'), '');

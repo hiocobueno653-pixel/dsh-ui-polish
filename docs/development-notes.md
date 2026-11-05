@@ -74,14 +74,16 @@ DSH 的界面细节打磨层：**宿主哪里漏画了，这里补上**。纯 CS
 │            Max                │ ← 当前档位（居中、强调色）
 │   DeepSeek-V41-Flash       ›  │ ← 模型名居中 + 箭头；点这行进模型列表
 │ ●───────────────○            │ ← 推理等级滑杆（拖动/点击/键盘）
-│ Off   Low   High   Max        │ ← 原来的选项行仍然在，可点可读屏
+│ （选项行在 DOM 里但 display:none） │ ← 提交兜底与读屏锚点，看不见
 └───────────────────────────────┘
 ```
 
 对照参考图逐项核对过（`outputs/ui-polish/04-*`）：
 当前档位那行是**克隆宿主单元格**后改造的——藏掉「模型」二字、居中、箭头调淡；
 档位标题用强调色 15px/600；刻点数 = 档数（DSH 是 4 档，所以 4 个点）。
-**有意保留的差异**：滑杆下面那四行没有去掉（它们是文案与读屏路径，参考实现只有裸刻点）；
+**选项行已隐藏**（用户要求滑杆替代列表，和参考实现一致）：只 `display:none`，
+元素仍留在 DOM 里 —— `radio.click()` 是提交失败的兜底落点，读屏走滑杆自己的
+`role=slider` + `aria-valuenow/valuetext`。
 滑钮两端内缩一个半径（不探出轨道，几何上更稳）。
 
 怎么做到的（都是真机上量出来的，改之前先看这几条）：
@@ -112,7 +114,7 @@ DSH 的界面细节打磨层：**宿主哪里漏画了，这里补上**。纯 CS
 几个刻意的设计：
 
 - **档位名字从 DOM 里读**（`menuitemradio` 的文本），不写死 Off/Low/High/Max——换模型、换语言都跟着变。
-- **不复制标签**：列表就在滑杆下面，滑杆只画刻度（点的个数 = 档数）；拖动时点亮对应行，两者说的是同一件事。
+- **不复制标签**：滑杆只画刻度（点的个数 = 档数），拖动时点亮对应档（`data-dshp-target`）；原来的选项行留在 DOM 里但被隐藏，两者说的是同一件事。
 - **几何**：滑钮行程 = 轨道宽减一个滑钮直径，两端都留在轨道里；只写一个 `--dshp-t: 0~1`，算式交给 CSS，拖动时关过渡（跟手），松手回弹才用 160ms。
 - **轨道颜色用「文字色的低透明度」**，不用 `bg-layer-2`：浅色主题里 `bg-layer-2` 就是白色，压在毛玻璃上等于没有轨道；用文字色深浅主题自动反相。
 - **滑钮固定白色（`--dshp-knob:#fff`）**，不跟 `bg-layer-1`：深色主题里 `bg-layer-1`
@@ -721,3 +723,37 @@ O 组把这四件事各验一条，避免以后再靠记忆描述这个开关。
 `http://127.0.0.1:<port>` 直接请求返回 401；内置浏览器 provider 也起不来
 （没有可 spawn 的 Electron 二进制）。所以结论只能靠"读宿主源码核对契约 +
 Playwright 夹具"两层，交付时要如实说明这一点。
+
+## DSH 2026-11 构建：档位行被包进滚动容器（滑杆下面又冒出列表）
+
+**现象**（用户截图）：等级页顶部灰框和滑杆都正常，滑杆下面却还挂着
+Default / Low / High / Max 四行原生单选项。
+
+**根因**：宿主把档位页的选项包了一层滚动容器：
+
+```html
+<div role="menu" data-menu-material="translucent">   <!-- MenuSurface 根 -->
+  <div aria-hidden="true" class="_material_.."></div>
+  <div class="groups scrollable">                    <!-- ← 2026-11 新增的一层 -->
+    <button role="menuitemradio" aria-checked="false">Default</button>
+    …
+  </div>
+</div>
+```
+
+插件隐藏选项行用的是直接子级选择器 `.dshp-levelPage > [role='menuitemradio']`，
+而选项现在是**孙级**，一条也匹配不上 —— 隐藏失效。滑杆本身照常插在
+`radios[0].parentNode`（也就是这层 `.groups`）里，所以"滑杆在、列表也在"。
+
+**修法**：改成后代选择器 `.dshp-levelPage [role='menuitemradio']`。
+模型列表页不带 `.dshp-levelPage`，放宽后不会误伤列表。
+
+**回归**：`test/level-hide.browser.test.mjs`（新宿主结构隐藏 / 老结构兼容 /
+列表页不受影响）。把选择器改回 `>` 时第一条立刻 FAIL（实测 `display:flex`）。
+
+**生效方式**：客户端包由 `@deepseek-ai/dsh-client-hmr` 每 500ms stat 一次
+`client.js` 的 mtime/ctime/size，变化即 `rebuilt()` → SSE `rebuilt` 帧 →
+页面热替换该插件。改完文件不需要重启 Host，刷新窗口只是兜底。
+
+**这次没做的验证**：仍然没有真机页面证据（401 问题同上）。结论来自
+宿主源码 + Playwright 夹具，交付时如实说明。
