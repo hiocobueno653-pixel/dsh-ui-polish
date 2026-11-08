@@ -757,3 +757,27 @@ Default / Low / High / Max 四行原生单选项。
 
 **这次没做的验证**：仍然没有真机页面证据（401 问题同上）。结论来自
 宿主源码 + Playwright 夹具，交付时如实说明。
+
+## 等级页冒滚动条、滑杆能被上下拖着走
+
+**现象**（用户截图）：模型行 + 滑杆右侧出现一条滚动条，整块内容可以上下滚。
+
+**成因**：宿主把选项行放在一层可滚容器里
+（`MenuSurface > div.groups.scrollable > button[role=menuitemradio]`），
+滑杆插在同一层。这一层是 flex 列里的**可收缩项**（`flex-shrink:1` + `min-height:0`），
+面板一旦比内容矮一点就会被压短，滚动条随即出现，滑杆跟着滚动。
+
+真机不信"看起来没溢出"，所以在夹具里把面板压到 70px 复现，量到两件事：
+
+| 措施 | 不做时 | 做了之后 |
+| --- | --- | --- |
+| `flex:none` | `clientHeight` 被压到 0，滑杆整条消失 | 保住 36px，滑杆完整 |
+| `overflow:clip`（不是 hidden） | `hidden` 只是"用户滚不动"，`scrollTop` 仍可被程序改到 36，`getBoundingClientRect().top` 跟着位移 36px | 该层不再是滚动容器，`scrollTop` 恒为 0 |
+
+再加 `scrollbar-width:none` 去掉 overlay 滚动条的占位。
+
+**认层方式**：`:has(> .dshp-slider)`，不依赖宿主的哈希类名；不支持 `:has` 的浏览器
+会把整条规则丢掉，退回原行为。只锁"装着滑杆的那一层"，模型列表页不受影响。
+
+**回归**：`test/level-fixed.browser.test.mjs`（锁滚动 / 不被压扁 / 面板够高时完整可见 /
+列表页仍可滚）。把 `overflow:clip` 改回 `overflow:hidden` 时"改 scrollTop 不动"那条立刻 FAIL。
